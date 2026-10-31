@@ -1,0 +1,23 @@
+[Unit]
+Description=HoeShutdownNotifier (Telegram bot + моніторинг відключень)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dev
+Group=dev
+WorkingDirectory=/opt/scripts/HoeShutdownNotifier2
+ExecStart=/opt/scripts/HoeShutdownNotifier2/venv/bin/python -m hoe_notifier
+Restart=on-failure
+RestartSec=10
+
+# Мінімальне посилення ізоляції
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/scripts/HoeShutdownNotifier2/data
+
+[Install]
+WantedBy=multi-user.target

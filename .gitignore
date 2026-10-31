@@ -1,0 +1,8 @@
+.env
+addresses.toml
+data/
+logs/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
