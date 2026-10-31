@@ -1,6 +1,6 @@
 # ⚡ HoeShutdownNotifier
 
-[![tests](https://github.com/DraKuLa21-a42/HoeShutdownNotifier/actions/workflows/tests.yml/badge.svg)](https://github.com/DraKuLa21-a42/HoeShutdownNotifier/actions/workflows/tests.yml)
+[![tests](https://github.com/DraKuLa21-a42/HoeShutdownNotifier_v2/actions/workflows/tests.yml/badge.svg)](https://github.com/DraKuLa21-a42/HoeShutdownNotifier_v2/actions/workflows/tests.yml)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![aiogram](https://img.shields.io/badge/aiogram-3.x-2CA5E0)
 
