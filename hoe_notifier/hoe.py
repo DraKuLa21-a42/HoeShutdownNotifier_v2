@@ -115,10 +115,12 @@ def parse_text_schedule(html: str) -> str | None:
 
     На сайті це `<p>` у `div.post`, рядки розділені `<br>`, а групи черг — подвійним `<br>`.
     Розпізнаємо за змістом, а не за точним формулюванням, бо текст щодня трохи інший.
+    Результат не залежить від того, як перенесено рядки у вихідному коді сторінки.
     """
     soup = BeautifulSoup(html, "html.parser")
     for p in (soup.select_one("div.post") or soup).find_all("p"):
-        inner = _BR.sub("\n", p.decode_contents())
+        # Переноси рядків і відступи у вихідному HTML — це звичайні пробіли; розрив рядка дає лише <br>.
+        inner = _BR.sub("\n", re.sub(r"\s+", " ", p.decode_contents()))
         text = normalize_blocks(BeautifulSoup(inner, "html.parser").get_text())
         has_times = any(_TIME_RANGE.search(line) for line in text.splitlines())
         if has_times and "черг" in text.casefold():

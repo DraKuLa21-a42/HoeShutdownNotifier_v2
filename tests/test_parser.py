@@ -151,3 +151,29 @@ def test_image_url_not_found_on_text_page():
 def test_image_url_resolves_relative_path():
     assert parse_image_url('<img alt="ГПВ" src="/Content/a.png">', "https://hoe.com.ua/") == \
         "https://hoe.com.ua/Content/a.png"
+
+
+# ------------------------------------------- переноси рядків у вихідному HTML не мають ділити речення
+def test_text_schedule_ignores_line_wraps_in_html_source():
+    """Редактор/форматер може перенести довгий рядок у файлі — це не розрив рядка на сторінці."""
+    expected = parse_text_schedule(REAL_PAGE)
+    variants = {
+        "wrap_mid_sentence": REAL_PAGE.replace("застосовані графіки погодинних", "застосовані графіки\nпогодинних"),
+        "wrap_with_indent": REAL_PAGE.replace("на Хмельниччині будуть", "на Хмельниччині\n        \t будуть"),
+        "crlf": REAL_PAGE.replace("\n", "\r\n"),
+        "wrap_everywhere": REAL_PAGE.replace(" ", "\n"),
+    }
+    for name, html in variants.items():
+        assert parse_text_schedule(html) == expected, name
+    first = expected.splitlines()[0]
+    assert first.endswith("(ГПВ):") and "графіки погодинних відключень" in first
+
+
+def test_text_schedule_br_is_the_only_line_break():
+    html = "<div class='post'><p>Підчерга 1.1 – 00:00-04:00;\n   09:00-13:00.<br>\nПідчерга 1.2 – 02:00-06:00.</p></div>"
+    assert parse_text_schedule(html) == "Підчерга 1.1 – 00:00-04:00; 09:00-13:00.\nПідчерга 1.2 – 02:00-06:00."
+
+
+def test_text_schedule_double_br_still_separates_groups_after_wrapping():
+    html = "<div class='post'><p>Заголовок черг:<br>\n<br>\nПідчерга 1.1 – 00:00-04:00.<br>\n<br>\nПідчерга 2.1 – 04:00-08:00.</p></div>"
+    assert parse_text_schedule(html) == "Заголовок черг:\n\nПідчерга 1.1 – 00:00-04:00.\n\nПідчерга 2.1 – 04:00-08:00."
