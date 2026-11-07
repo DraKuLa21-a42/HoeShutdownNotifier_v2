@@ -21,7 +21,8 @@ from aiogram.types import (
 from .config import Settings
 from .db import Database, Subscription
 from .hoe import HoeClient, SearchUnavailable, match_house, suggest_houses
-from .monitor import MANUAL_REFRESH_MAX_AGE, Monitor, describe_state
+from .monitor import MANUAL_REFRESH_MAX_AGE, TEXT_GRAPH_SUBJECT, Monitor, describe_state
+from .sinks import fit_body, render_message
 
 log = logging.getLogger(__name__)
 
@@ -31,7 +32,8 @@ HELP = (
     "/add_id <code>&lt;streetId&gt; &lt;будинок&gt; [назва]</code> — додати адресу за ID вулиці\n"
     "/list — мої адреси та налаштування (сповіщення, графіки, звук)\n"
     "/check — перевірити всі мої адреси зараз\n"
-    "/graph — показати актуальний графік\n"
+    "/graph — показати актуальний графік (картинку та/або текст — як опубліковано на сайті)\n"
+    "/admin — панель адміністратора (лише для ADMIN_IDS)\n"
     "/cancel — скасувати поточну дію\n\n"
     "<b>Сповіщення в канал або групу.</b> Додай бота в канал адміністратором з правом "
     "«Публікація повідомлень» і дописуй до команди <code>--to=&lt;ID каналу або @username&gt;</code>:\n"
@@ -498,32 +500,126 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
             await message.answer(
                 f"📍 <b>{escape(sub.label)}</b>\n<pre>{escape(describe_state(state))}</pre>{suffix}")
 
+    async def send_site_graph(message: Message, *, text: bool = True, image: bool = True) -> bool:
+        """Показує поточний графік із сайту в цьому чаті. True — щось показано."""
+        graphs = await hoe.fetch_graphs()
+        if graphs is None:
+            await message.answer("Не вдалося завантажити сторінку графіків.")
+            return False
+        shown = False
+        if text and graphs.text:
+            await message.answer(render_message(TEXT_GRAPH_SUBJECT, "", graphs.text, pre=False))
+            shown = True
+        if image and graphs.image_url:
+            try:
+                data = await hoe.download(graphs.image_url)
+                await message.answer_photo(BufferedInputFile(data, filename="graph.png"))
+                shown = True
+            except Exception:
+                log.warning("Не вдалось завантажити картинку графіка", exc_info=True)
+                await message.answer("Не вдалося завантажити картинку графіка.")
+        if not shown:
+            kind = "графіка" if text and image else ("текстового графіка" if text else "картинки-графіка")
+            await message.answer(f"На сайті зараз немає {kind}.")
+        return shown
+
     @router.message(Command("graph"))
     async def graph(message: Message) -> None:
         if not allowed(message.chat.id, message.from_user.id if message.from_user else 0):
             return
-        url = await hoe.fetch_graph_url()
-        if not url:
-            await message.answer("Не вдалося знайти графік на сайті.")
+        await send_site_graph(message)
+
+    # --- панель адміністратора --------------------------------------------
+    def stats_text() -> str:
+        s = db.stats()
+        last = (time.strftime("%H:%M:%S %d.%m.%Y", time.localtime(monitor.last_poll_at))
+                if monitor.last_poll_at else "—")
+        return (f"Чатів: {s['targets']}\nПідписок: {s['subscriptions']}\nУнікальних адрес: {s['addresses']}\n"
+                f"Чатів із графіком: {len(db.graph_targets())}\n"
+                f"Останній цикл: {last} ({monitor.last_poll_summary})\n"
+                f"Інтервал: {settings.poll_interval} с")
+
+    def admin_keyboard() -> InlineKeyboardMarkup:
+        def btn(text: str, data: str) -> InlineKeyboardButton:
+            return InlineKeyboardButton(text=text, callback_data=data)
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [btn("📊 Статистика", "adm:stats"), btn("🔄 Опитати зараз", "adm:poll")],
+            [btn("📋 Показати текстовий графік", "adm:show_text")],
+            [btn("🖼 Показати картинку-графік", "adm:show_img")],
+            [btn("📤 Розіслати текстовий графік", "adm:send_text")],
+            [btn("📤 Розіслати картинку-графік", "adm:send_img")],
+        ])
+
+    ADMIN_HELP = ("<b>Панель адміністратора</b>\n"
+                  "«Показати» — лише тобі. «Розіслати» — усім чатам, що ввімкнули «Графік» (з підтвердженням); "
+                  "автоматично графік надсилається сам, щойно змінюється на сайті.")
+
+    @router.message(Command("admin"))
+    async def admin(message: Message) -> None:
+        if (not message.from_user or message.from_user.id not in settings.admin_ids
+                or message.chat.type != ChatType.PRIVATE):
             return
-        try:
-            data = await hoe.download(url)
-        except Exception:
-            await message.answer("Не вдалося завантажити графік.")
-            return
-        await message.answer_photo(BufferedInputFile(data, filename="graph.png"))
+        await message.answer(ADMIN_HELP, reply_markup=admin_keyboard())
 
     @router.message(Command("stats"))
     async def stats(message: Message) -> None:
         if not message.from_user or message.from_user.id not in settings.admin_ids:
             return
-        s = db.stats()
-        last = (time.strftime("%H:%M:%S %d.%m.%Y", time.localtime(monitor.last_poll_at))
-                if monitor.last_poll_at else "—")
-        await message.answer(
-            f"Чатів: {s['targets']}\nПідписок: {s['subscriptions']}\nУнікальних адрес: {s['addresses']}\n"
-            f"Останній цикл: {last} ({monitor.last_poll_summary})\n"
-            f"Інтервал: {settings.poll_interval} с")
+        await message.answer(stats_text())
+
+    @router.callback_query(F.data.regexp(r"^adm:(stats|poll|show_text|show_img|send_text|send_img)(:(yes|no))?$"))
+    async def admin_action(cb: CallbackQuery) -> None:
+        if cb.from_user.id not in settings.admin_ids or cb.message.chat.type != ChatType.PRIVATE:
+            await cb.answer("Лише для адміністраторів.", show_alert=True)
+            return
+        parts = cb.data.split(":")
+        action, confirm = parts[1], (parts[2] if len(parts) > 2 else None)
+
+        if action == "stats":
+            await cb.answer()
+            await cb.message.answer(stats_text())
+        elif action == "poll":
+            await cb.answer("Опитую сайт…")
+            await monitor.poll_once()
+            await cb.message.answer(f"🔄 Готово: {monitor.last_poll_summary}")
+        elif action in {"show_text", "show_img"}:
+            await cb.answer()
+            await send_site_graph(cb.message, text=action == "show_text", image=action == "show_img")
+        else:  # send_text / send_img — розсилка вручну, з підтвердженням
+            as_text = action == "send_text"
+            kind = "текстовий графік" if as_text else "картинку-графік"
+            if confirm == "no":
+                await cb.message.edit_text("Розсилку скасовано.")
+                await cb.answer()
+            elif confirm is None:
+                graphs = await hoe.fetch_graphs()
+                available = graphs and (graphs.text if as_text else graphs.image_url)
+                if graphs is None:
+                    await cb.answer("Сторінку графіків не вдалося завантажити.", show_alert=True)
+                elif not available:
+                    await cb.answer(f"На сайті зараз немає: {kind}.", show_alert=True)
+                else:
+                    preview = ("\n\n" + escape(fit_body(graphs.text, 1200))) if as_text else ""
+                    n = len(db.graph_targets())
+                    kb = InlineKeyboardMarkup(inline_keyboard=[[
+                        InlineKeyboardButton(text="✅ Так, розіслати", callback_data=f"adm:{action}:yes"),
+                        InlineKeyboardButton(text="✖ Скасувати", callback_data=f"adm:{action}:no"),
+                    ]])
+                    await cb.message.answer(f"Розіслати {kind} <b>{n}</b> чатам, які ввімкнули «Графік»?{preview}",
+                                            reply_markup=kb)
+                    await cb.answer()
+            else:  # yes
+                await cb.answer()
+                await cb.message.edit_text("⏳ Розсилаю…")
+                report = await monitor.send_graphs(image=not as_text, text=as_text, force=True)
+                sent = report.text_sent if as_text else report.image_sent
+                if not report.page_ok:
+                    result = "❌ Сторінку графіків не вдалося завантажити."
+                elif report.error:
+                    result = f"❌ Помилка: {escape(report.error)}."
+                else:
+                    result = f"✅ Надіслано {sent} з {report.targets} чатів."
+                await cb.message.edit_text(result)
 
     return router
 

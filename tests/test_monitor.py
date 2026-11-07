@@ -1,6 +1,6 @@
 import pytest
 from hoe_notifier.db import Database
-from hoe_notifier.hoe import HoeUnavailable
+from hoe_notifier.hoe import Graphs, HoeUnavailable
 from hoe_notifier.monitor import Monitor, SUBJECT_CHANGED, SUBJECT_NEW, SUBJECT_NONE
 from hoe_notifier.sinks import TargetGone, TargetMigrated
 
@@ -14,6 +14,8 @@ class FakeHoe:
         self.html = TABLE_A
         self.fail = False
         self.graph_url = None
+        self.graph_text = None
+        self.page_down = False
         self.calls = 0
 
     async def fetch_events_html(self, street_id, house):
@@ -22,8 +24,10 @@ class FakeHoe:
             raise HoeUnavailable("down")
         return self.html
 
-    async def fetch_graph_url(self):
-        return self.graph_url
+    async def fetch_graphs(self):
+        if self.page_down:
+            return None
+        return Graphs(image_url=self.graph_url, text=self.graph_text)
 
     async def download(self, url):
         return b"PNG"
@@ -32,13 +36,15 @@ class FakeHoe:
 class FakeSink:
     def __init__(self):
         self.texts, self.photos, self.gone, self.moved = [], [], set(), {}
+        self.pre_flags = []
 
-    async def send_text(self, target, subject, label, body, *, silent):
+    async def send_text(self, target, subject, label, body, *, silent, pre=True):
         if target in self.gone:
             raise TargetGone("blocked")
         if target in self.moved:
             raise TargetMigrated(self.moved[target])
         self.texts.append((target, subject, label, body))
+        self.pre_flags.append(pre)
 
     async def send_photo(self, target, data, *, silent):
         if target in self.moved:
@@ -218,3 +224,116 @@ async def test_graph_to_migrated_chat(env):
     hoe.graph_url = "https://x/1.png"
     await mon.poll_once()
     assert sink.photos == ["-1009"]
+
+
+# ---------------------------------------------------------------- текстовий графік
+SCHEDULE = "За розпорядженням 07 листопада:\n\nПідчерга 1.1 – 00:00-04:00; 09:00-13:00."
+SCHEDULE_2 = "За розпорядженням 08 листопада:\n\nПідчерга 1.1 – 02:00-06:00."
+
+
+def graph_texts(sink):
+    return [t for t in sink.texts if t[1] == "Графік погодинних відключень"]
+
+
+async def test_text_graph_sent_once_then_on_change(env):
+    db, hoe, sink, mon, _ = env
+    db.add_subscription("tg", "1", "10", "5", "A", graphs=True)
+    hoe.graph_text = SCHEDULE
+    await mon.poll_once()
+    await mon.poll_once()
+    assert [t[3] for t in graph_texts(sink)] == [SCHEDULE]          # без повторів
+    hoe.graph_text = SCHEDULE_2
+    await mon.poll_once()
+    assert [t[3] for t in graph_texts(sink)] == [SCHEDULE, SCHEDULE_2]
+
+
+async def test_text_graph_is_plain_not_preformatted_and_has_no_label(env):
+    db, hoe, sink, mon, _ = env
+    db.add_subscription("tg", "1", "10", "5", "A", graphs=True)
+    hoe.graph_text = SCHEDULE
+    await mon.poll_once()
+    idx = [i for i, t in enumerate(sink.texts) if t[1] == "Графік погодинних відключень"][0]
+    assert sink.pre_flags[idx] is False and sink.texts[idx][2] == ""
+
+
+async def test_text_graph_only_for_graph_subscribers_once_per_chat(env):
+    db, hoe, sink, mon, _ = env
+    db.add_subscription("tg", "1", "10", "5", "A", graphs=True)
+    db.add_subscription("tg", "1", "11", "5", "B", graphs=True)     # той самий чат, інша адреса
+    db.add_subscription("tg", "2", "10", "5", "A", graphs=False)    # графік вимкнено
+    hoe.graph_text = SCHEDULE
+    await mon.poll_once()
+    assert [t[0] for t in graph_texts(sink)] == ["1"]
+
+
+async def test_image_and_text_both_published(env):
+    db, hoe, sink, mon, _ = env
+    db.add_subscription("tg", "1", "10", "5", "A", graphs=True)
+    hoe.graph_url, hoe.graph_text = "https://x/1.png", SCHEDULE
+    await mon.poll_once()
+    assert sink.photos == ["1"] and len(graph_texts(sink)) == 1
+
+
+async def test_no_text_on_page_sends_nothing_and_keeps_marker(env):
+    db, hoe, sink, mon, _ = env
+    db.add_subscription("tg", "1", "10", "5", "A", graphs=True)
+    hoe.graph_text = SCHEDULE
+    await mon.poll_once()
+    hoe.graph_text = None                      # сторінка перейшла на картинку
+    await mon.poll_once()
+    hoe.graph_text = SCHEDULE                  # і повернулась до того самого тексту
+    await mon.poll_once()
+    assert len(graph_texts(sink)) == 1
+
+
+async def test_graph_page_down_is_harmless(env):
+    db, hoe, sink, mon, _ = env
+    db.add_subscription("tg", "1", "10", "5", "A", graphs=True)
+    hoe.page_down = True
+    await mon.poll_once()
+    assert graph_texts(sink) == [] and sink.photos == []
+
+
+async def test_force_resends_even_if_unchanged(env):
+    db, hoe, sink, mon, _ = env
+    db.add_subscription("tg", "1", "10", "5", "A", graphs=True)
+    hoe.graph_text, hoe.graph_url = SCHEDULE, "https://x/1.png"
+    await mon.poll_once()
+    report = await mon.send_graphs(image=False, text=True, force=True)
+    assert report.text_sent == 1 and report.image_sent == 0 and report.targets == 1
+    assert len(graph_texts(sink)) == 2 and sink.photos == ["1"]       # картинку не чіпали
+
+
+async def test_force_image_only(env):
+    db, hoe, sink, mon, _ = env
+    db.add_subscription("tg", "1", "10", "5", "A", graphs=True)
+    hoe.graph_text, hoe.graph_url = SCHEDULE, "https://x/1.png"
+    report = await mon.send_graphs(image=True, text=False, force=True)
+    assert report.image_sent == 1 and report.text_sent == 0
+    assert graph_texts(sink) == [] and sink.photos == ["1"]
+
+
+async def test_manual_send_marks_as_sent_so_auto_does_not_duplicate(env):
+    db, hoe, sink, mon, _ = env
+    db.add_subscription("tg", "1", "10", "5", "A", graphs=True)
+    hoe.graph_text = SCHEDULE
+    await mon.send_graphs(image=False, text=True, force=True)
+    await mon.poll_once()
+    assert len(graph_texts(sink)) == 1
+
+
+async def test_report_when_nothing_to_send(env):
+    db, hoe, sink, mon, _ = env
+    report = await mon.send_graphs(force=True)
+    assert report.page_ok and not report.text_found and not report.image_found and report.targets == 0
+    hoe.page_down = True
+    assert (await mon.send_graphs(force=True)).page_ok is False
+
+
+async def test_text_graph_blocked_chat_is_unsubscribed(env):
+    db, hoe, sink, mon, _ = env
+    db.add_subscription("tg", "1", "10", "5", "A", graphs=True)
+    sink.gone.add("1")
+    hoe.graph_text = SCHEDULE
+    report = await mon.send_graphs(text=True, image=False, force=True)
+    assert report.text_sent == 0 and db.list_subscriptions("tg", "1") == []

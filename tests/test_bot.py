@@ -126,6 +126,7 @@ def make_env(**settings_over):
     async def send(update):
         await dp.feed_update(bot, update)
 
+    hoe.sink, hoe.monitor = sink, mon
     return db, hoe, session, send, msg, cb
 
 
@@ -574,3 +575,173 @@ async def test_member_status_change_keeps_subscriptions(env):
     db.add_subscription("tg", "-100", "10", "5", "A")
     await send(kicked_update(-100, "supergroup", status="member"))
     assert db.count_for_target("tg", "-100") == 1
+
+
+# ---------------------------------------------------------------- графік (текст / картинка) та адмін-панель
+SCHEDULE = "За розпорядженням 07 листопада:\n\nПідчерга 1.1 – 00:00-04:00; 09:00-13:00."
+
+
+def last_send_message(session):
+    return [m for m in session.methods if type(m).__name__ == "SendMessage"][-1]
+
+
+def alerts(session):
+    return [m for m in session.methods if type(m).__name__ == "AnswerCallbackQuery" and m.show_alert]
+
+
+def button_texts(method):
+    return [b.text for row in method.reply_markup.inline_keyboard for b in row]
+
+
+async def test_graph_command_shows_text_schedule(env):
+    from hoe_notifier.hoe import Graphs
+    db, hoe, session, send, msg, cb = env
+    hoe.graph_text = SCHEDULE
+    await send(msg("/graph"))
+    out = last_send_message(session).text
+    assert out.startswith("<b>Графік погодинних відключень</b>\n\n") and "Підчерга 1.1" in out
+    assert "<pre>" not in out                       # звичайним текстом, не блоком коду
+
+
+async def test_graph_command_shows_image(env):
+    db, hoe, session, send, msg, cb = env
+    hoe.graph_url = "https://x/1.png"
+    await send(msg("/graph"))
+    assert any(type(m).__name__ == "SendPhoto" for m in session.methods)
+
+
+async def test_graph_command_shows_both(env):
+    db, hoe, session, send, msg, cb = env
+    hoe.graph_url, hoe.graph_text = "https://x/1.png", SCHEDULE
+    await send(msg("/graph"))
+    names = [type(m).__name__ for m in session.methods]
+    assert "SendPhoto" in names and any("Підчерга" in (t or "") for t in session.texts())
+
+
+async def test_graph_command_nothing_published_and_page_down(env):
+    db, hoe, session, send, msg, cb = env
+    await send(msg("/graph"))
+    assert "немає графіка" in session.texts()[-1]
+    hoe.page_down = True
+    await send(msg("/graph"))
+    assert "Не вдалося завантажити сторінку" in session.texts()[-1]
+
+
+async def test_admin_panel_has_buttons(env):
+    db, hoe, session, send, msg, cb = env
+    await send(msg("/admin"))
+    labels = button_texts(last_send_message(session))
+    for expected in ("📊 Статистика", "🔄 Опитати зараз", "📋 Показати текстовий графік",
+                     "🖼 Показати картинку-графік", "📤 Розіслати текстовий графік", "📤 Розіслати картинку-графік"):
+        assert expected in labels
+
+
+async def test_admin_panel_hidden_from_non_admins_and_groups():
+    db, hoe, session, send, msg, cb = make_env(admin_ids=frozenset())
+    await send(msg("/admin"))
+    assert session.methods == []                    # мовчки ігнорує
+    db.close()
+    db, hoe, session, send, msg, cb = make_env()
+    await send(msg("/admin", chat_type="supergroup", chat_id=-5))
+    assert session.methods == []
+    db.close()
+
+
+async def test_admin_buttons_rejected_for_non_admins():
+    db, hoe, session, send, msg, cb = make_env(admin_ids=frozenset())
+    hoe.graph_text = SCHEDULE
+    db.add_subscription("tg", "7", "10", "5", "A", graphs=True)
+    await send(cb("adm:send_text:yes"))
+    assert alerts(session) and hoe.sink.texts == []
+    db.close()
+
+
+async def test_admin_show_text_goes_only_to_admin(env):
+    db, hoe, session, send, msg, cb = env
+    db.add_subscription("tg", "7", "10", "5", "A", graphs=True)
+    hoe.graph_text = SCHEDULE
+    await send(cb("adm:show_text"))
+    assert any("Підчерга 1.1" in (t or "") for t in session.texts())
+    assert hoe.sink.texts == []                      # підписникам нічого не пішло
+
+
+async def test_admin_show_when_missing(env):
+    db, hoe, session, send, msg, cb = env
+    await send(cb("adm:show_text"))
+    assert "немає текстового графіка" in session.texts()[-1]
+    await send(cb("adm:show_img"))
+    assert "немає картинки-графіка" in session.texts()[-1]
+
+
+async def test_admin_send_text_requires_confirmation_then_broadcasts(env):
+    db, hoe, session, send, msg, cb = env
+    db.add_subscription("tg", "7", "10", "5", "A", graphs=True)
+    db.add_subscription("tg", "8", "10", "5", "A", graphs=True)
+    db.add_subscription("tg", "9", "10", "5", "A", graphs=False)    # не підписаний на графік
+    hoe.graph_text = SCHEDULE
+
+    await send(cb("adm:send_text"))
+    prompt = last_send_message(session)
+    assert "<b>2</b> чатам" in prompt.text and "Підчерга 1.1" in prompt.text     # кількість і попередній перегляд
+    assert hoe.sink.texts == []                                                  # ще нічого не розіслано
+    assert "✅ Так, розіслати" in button_texts(prompt)
+
+    await send(cb("adm:send_text:yes"))
+    sent = [t for t in hoe.sink.texts if t[1] == "Графік погодинних відключень"]
+    assert sorted(t[0] for t in sent) == ["7", "8"]
+    assert session.texts()[-1] == "✅ Надіслано 2 з 2 чатів."
+
+
+async def test_admin_send_text_cancel(env):
+    db, hoe, session, send, msg, cb = env
+    db.add_subscription("tg", "7", "10", "5", "A", graphs=True)
+    hoe.graph_text = SCHEDULE
+    await send(cb("adm:send_text"))
+    await send(cb("adm:send_text:no"))
+    assert session.texts()[-1] == "Розсилку скасовано." and hoe.sink.texts == []
+
+
+async def test_admin_send_text_unavailable_shows_alert(env):
+    db, hoe, session, send, msg, cb = env
+    db.add_subscription("tg", "7", "10", "5", "A", graphs=True)
+    await send(cb("adm:send_text"))                  # на сайті немає тексту
+    assert alerts(session) and "немає" in alerts(session)[-1].text
+    hoe.page_down = True
+    await send(cb("adm:send_text"))
+    assert "не вдалося завантажити" in alerts(session)[-1].text
+
+
+async def test_admin_send_image(env):
+    db, hoe, session, send, msg, cb = env
+    db.add_subscription("tg", "7", "10", "5", "A", graphs=True)
+    hoe.graph_url = "https://x/1.png"
+    await send(cb("adm:send_img"))
+    assert "картинку-графік" in last_send_message(session).text
+    await send(cb("adm:send_img:yes"))
+    assert hoe.sink.photos == ["7"] and session.texts()[-1] == "✅ Надіслано 1 з 1 чатів."
+
+
+async def test_admin_manual_send_does_not_cause_auto_duplicate(env):
+    db, hoe, session, send, msg, cb = env
+    db.add_subscription("tg", "7", "10", "5", "A", graphs=True)
+    hoe.graph_text = SCHEDULE
+    await send(cb("adm:send_text"))
+    await send(cb("adm:send_text:yes"))
+    await hoe.monitor.poll_once()
+    assert len([t for t in hoe.sink.texts if t[1] == "Графік погодинних відключень"]) == 1
+
+
+async def test_admin_stats_and_poll_buttons(env):
+    db, hoe, session, send, msg, cb = env
+    db.add_subscription("tg", "7", "10", "5", "A", graphs=True)
+    await send(cb("adm:stats"))
+    assert "Чатів із графіком: 1" in session.texts()[-1]
+    await send(cb("adm:poll"))
+    assert "Готово: 1/1 адрес оновлено" in session.texts()[-1]
+    assert hoe.calls == 1
+
+
+async def test_stats_command_still_works(env):
+    db, hoe, session, send, msg, cb = env
+    await send(msg("/stats"))
+    assert "Унікальних адрес" in session.texts()[-1]

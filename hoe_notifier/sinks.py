@@ -34,8 +34,24 @@ def fit_body(body: str, limit: int, measure=len) -> str:
     return body.rstrip() + "\n…"
 
 
+def render_message(subject: str, label: str, body: str, *, pre: bool = True) -> str:
+    """HTML для Telegram: <b>заголовок</b>, 📍адреса, текст (у блоці <pre> або звичайним абзацом)."""
+    parts = []
+    if subject:
+        parts.append(f"<b>{escape(subject)}</b>")
+    if label:
+        parts.append(f"📍 {escape(label)}")
+    text = "\n".join(parts)
+    body = fit_body(body, TG_BODY_LIMIT, measure=lambda b: len(escape(b)))
+    if body:
+        shown = f"<pre>{escape(body)}</pre>" if pre else escape(body)
+        text += ("\n\n" if text else "") + shown
+    return text
+
+
 class Sink(Protocol):
-    async def send_text(self, target: str, subject: str, label: str, body: str, *, silent: bool) -> None: ...
+    async def send_text(self, target: str, subject: str, label: str, body: str, *, silent: bool,
+                        pre: bool = True) -> None: ...
     async def send_photo(self, target: str, data: bytes, *, silent: bool) -> None: ...
 
 
@@ -63,18 +79,10 @@ class TelegramSink:
                     raise TargetGone(str(exc)) from exc
                 raise
 
-    async def send_text(self, target, subject, label, body, *, silent):
-        parts = []
-        if subject:
-            parts.append(f"<b>{escape(subject)}</b>")
-        if label:
-            parts.append(f"📍 {escape(label)}")
-        text = "\n".join(parts)
-        body = fit_body(body, TG_BODY_LIMIT, measure=lambda b: len(escape(b)))
-        if body:
-            text += ("\n\n" if text else "") + f"<pre>{escape(body)}</pre>"
+    async def send_text(self, target, subject, label, body, *, silent, pre=True):
         await self._call(
-            self.bot.send_message, chat_id=int(target), text=text,
+            self.bot.send_message, chat_id=int(target),
+            text=render_message(subject, label, body, pre=pre),
             parse_mode="HTML", disable_notification=silent,
         )
 
@@ -100,10 +108,11 @@ class SlackSink:
                 raise TargetGone(str(exc)) from exc
             raise
 
-    async def send_text(self, target, subject, label, body, *, silent):
+    async def send_text(self, target, subject, label, body, *, silent, pre=True):
         body = fit_body(body, SLACK_BODY_LIMIT)
         head = "\n".join(x for x in (f"*{subject}*" if subject else "", f"📍 {label}" if label else "") if x)
-        text = head + ("\n" if head and body else "") + (f"```{body}```" if body else "")
+        shown = (f"```{body}```" if pre else body) if body else ""
+        text = head + ("\n" if head and shown else "") + shown
         await self._run(
             self.client.chat_postMessage, channel=target,
             text=(f"{subject} {label}".strip() or body[:100]),

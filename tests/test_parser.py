@@ -1,5 +1,8 @@
+from pathlib import Path
+
 from hoe_notifier.hoe import (
-    Option, ParseStatus, house_key, match_house, parse_events, parse_houses, parse_options, suggest_houses,
+    Option, ParseStatus, house_key, match_house, normalize_blocks, parse_events, parse_houses, parse_image_url,
+    parse_options, parse_text_schedule, suggest_houses,
 )
 
 FULL = """
@@ -89,3 +92,62 @@ def test_house_suggestions():
     assert suggest_houses(HOUSES, "7") == []
     assert suggest_houses(HOUSES, "") == []
     assert len(suggest_houses([str(i) for i in range(100, 200)], "1", limit=8)) == 8
+
+
+# ---------------------------------------------------------------- текстовий графік
+REAL_PAGE = (Path(__file__).parent / "fixtures" / "graph_text_page.html").read_text(encoding="utf-8")
+
+
+def test_text_schedule_from_real_page():
+    text = parse_text_schedule(REAL_PAGE)
+    lines = text.splitlines()
+    assert lines[0].startswith("За розпорядженням НЕК «Укренерго» 07 листопада")
+    assert lines[0].endswith("(ГПВ):")
+    assert "Підчерга 1.1 – 00:00-04:00; 09:00-13:00; 18:00-21:00." in lines
+    assert lines[-1] == "Підчерга 6.2 – 08:00-13:00; 17:00-22:00."
+    assert sum(l.startswith("Підчерга") for l in lines) == 12
+
+
+def test_text_schedule_keeps_group_separation():
+    text = parse_text_schedule(REAL_PAGE)
+    groups = text.split("\n\n")
+    assert len(groups) == 7                                   # заголовок + 6 черг
+    assert groups[1].count("\n") == 1                         # у групі дві підчерги
+    assert "\n\n\n" not in text and not text.endswith("\n")
+
+
+def test_text_schedule_ignores_unrelated_paragraphs():
+    html = ("<div class='post'><p>Перевірити чергу</p><p>Кол-центр 0 800 50 50 62</p>"
+            "<p>Підчерга 1.1 – 00:00-04:00.</p></div>")
+    assert parse_text_schedule(html) == "Підчерга 1.1 – 00:00-04:00."
+
+
+def test_text_schedule_absent():
+    assert parse_text_schedule("<div class='post'><p>Графіки не застосовуються.</p></div>") is None
+    assert parse_text_schedule("<html></html>") is None
+    # час без згадки черг — не графік
+    assert parse_text_schedule("<div class='post'><p>Кол-центр працює 08:00-17:00</p></div>") is None
+
+
+def test_text_schedule_without_post_wrapper():
+    html = "<body><p>Черга 2: 06:00-10:00<br>Черга 3: 10:00-14:00</p></body>"
+    assert parse_text_schedule(html) == "Черга 2: 06:00-10:00\nЧерга 3: 10:00-14:00"
+
+
+def test_text_schedule_other_dash_and_nbsp():
+    html = "<div class='post'><p>Підчерга\xa01.1 — 00:00–04:00;<br> 09:00–13:00</p></div>"
+    assert parse_text_schedule(html) == "Підчерга 1.1 — 00:00–04:00;\n09:00–13:00"
+
+
+def test_normalize_blocks():
+    assert normalize_blocks("  a \n\n\n\n b\n\n") == "a\n\nb"
+    assert normalize_blocks("") == ""
+
+
+def test_image_url_not_found_on_text_page():
+    assert parse_image_url(REAL_PAGE, "https://hoe.com.ua") is None
+
+
+def test_image_url_resolves_relative_path():
+    assert parse_image_url('<img alt="ГПВ" src="/Content/a.png">', "https://hoe.com.ua/") == \
+        "https://hoe.com.ua/Content/a.png"

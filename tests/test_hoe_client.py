@@ -30,15 +30,34 @@ async def test_gives_up_after_retries():
         await c.fetch_events_html("1", "2")
 
 
-async def test_graph_url_found_and_joined():
+async def test_fetch_graphs_image_only():
     html = '<img alt="Графік" src="/a.png"><img alt="ГПВ на сьогодні" src="/Content/gpv.png">'
-    c = make(lambda r: httpx.Response(200, text=html))
-    assert await c.fetch_graph_url() == "https://hoe.test/Content/gpv.png"
+    g = await make(lambda r: httpx.Response(200, text=html)).fetch_graphs()
+    assert g.image_url == "https://hoe.test/Content/gpv.png" and g.text is None
 
 
-async def test_graph_url_none_on_error():
-    c = make(lambda r: httpx.Response(500))
-    assert await c.fetch_graph_url() is None
+async def test_fetch_graphs_text_only_from_real_page():
+    from pathlib import Path
+    html = (Path(__file__).parent / "fixtures" / "graph_text_page.html").read_text(encoding="utf-8")
+    g = await make(lambda r: httpx.Response(200, text=html)).fetch_graphs()
+    assert g.image_url is None
+    assert g.text.startswith("За розпорядженням НЕК") and "Підчерга 6.2 – 08:00-13:00; 17:00-22:00." in g.text
+
+
+async def test_fetch_graphs_none_on_error():
+    assert await make(lambda r: httpx.Response(500)).fetch_graphs() is None
+
+
+async def test_fetch_graphs_requests_the_graph_page():
+    seen = {}
+
+    def handler(request):
+        seen["path"] = request.url.path
+        return httpx.Response(200, text="<html></html>")
+
+    g = await make(handler).fetch_graphs()
+    assert seen["path"] == "/page/pogodinni-vidkljuchennja"
+    assert g.image_url is None and g.text is None
 
 
 async def test_ajax_headers_like_the_site():

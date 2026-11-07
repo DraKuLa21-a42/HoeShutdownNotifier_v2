@@ -2,7 +2,7 @@ import pytest
 from aiogram.exceptions import TelegramForbiddenError, TelegramMigrateToChat
 from aiogram.methods import SendMessage
 
-from hoe_notifier.sinks import TargetGone, TargetMigrated, TelegramSink, fit_body
+from hoe_notifier.sinks import SlackSink, TargetGone, TargetMigrated, TelegramSink, fit_body, render_message
 
 
 class FakeBot:
@@ -53,3 +53,30 @@ async def test_forbidden_error_becomes_target_gone():
     err = TelegramForbiddenError(method=SendMessage(chat_id=1, text="x"), message="Forbidden: bot was blocked")
     with pytest.raises(TargetGone):
         await TelegramSink(FakeBot(err)).send_text("1", "s", "l", "b", silent=True)
+
+
+def test_render_message_pre_and_plain():
+    assert render_message("Зміни", "Дім", "a<b>", pre=True) == "<b>Зміни</b>\n📍 Дім\n\n<pre>a&lt;b&gt;</pre>"
+    assert render_message("Графік", "", "a<b>\nрядок", pre=False) == "<b>Графік</b>\n\na&lt;b&gt;\nрядок"
+    assert render_message("", "", "тільки текст", pre=False) == "тільки текст"
+
+
+async def test_telegram_plain_text_mode_has_no_pre_block():
+    bot = FakeBot()
+    await TelegramSink(bot).send_text("1", "Графік", "", "Підчерга 1.1 – 00:00-04:00;", silent=True, pre=False)
+    text = bot.sent[0]["text"]
+    assert "<pre>" not in text and text.endswith("Підчерга 1.1 – 00:00-04:00;")
+
+
+async def test_slack_plain_text_mode_has_no_code_fence():
+    calls = []
+    sink = SlackSink("xoxb-test")
+
+    async def fake_run(func, **kwargs):
+        calls.append(kwargs)
+    sink._run = fake_run
+    await sink.send_text("C1", "Графік", "", "рядок 1\nрядок 2", silent=True, pre=False)
+    await sink.send_text("C1", "Зміни", "Дім", "Черга: 1.1", silent=True)
+    plain, fenced = (c["blocks"][0]["text"]["text"] for c in calls)
+    assert "```" not in plain and plain.endswith("рядок 1\nрядок 2")
+    assert fenced.endswith("```Черга: 1.1```") and "📍 Дім" in fenced

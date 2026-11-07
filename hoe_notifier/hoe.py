@@ -85,6 +85,55 @@ def parse_events(html: str) -> Parsed:
     return Parsed(ParseStatus.UNKNOWN)
 
 
+@dataclass(frozen=True)
+class Graphs:
+    """Графік, опублікований на сторінці погодинних відключень: картинка та/або текст."""
+    image_url: str | None = None
+    text: str | None = None
+
+
+_TIME_RANGE = re.compile(r"\d{1,2}:\d{2}\s*[-–—]\s*\d{1,2}:\d{2}")
+_BR = re.compile(r"<br\s*/?>\s*", re.IGNORECASE)
+
+
+def normalize_blocks(text: str) -> str:
+    """Рядки без зайвих пробілів; групи, розділені порожніми рядками, зберігаються (кілька порожніх → один)."""
+    out: list[str] = []
+    for line in text.replace("\xa0", " ").splitlines():
+        line = line.strip()
+        if line:
+            out.append(line)
+        elif out and out[-1] != "":
+            out.append("")
+    while out and out[-1] == "":
+        out.pop()
+    return "\n".join(out)
+
+
+def parse_text_schedule(html: str) -> str | None:
+    """Текстовий графік (ГПВ) зі сторінки: абзац, де є назви черг і інтервали часу (`00:00-04:00`).
+
+    На сайті це `<p>` у `div.post`, рядки розділені `<br>`, а групи черг — подвійним `<br>`.
+    Розпізнаємо за змістом, а не за точним формулюванням, бо текст щодня трохи інший.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    for p in (soup.select_one("div.post") or soup).find_all("p"):
+        inner = _BR.sub("\n", p.decode_contents())
+        text = normalize_blocks(BeautifulSoup(inner, "html.parser").get_text())
+        has_times = any(_TIME_RANGE.search(line) for line in text.splitlines())
+        if has_times and "черг" in text.casefold():
+            return text
+    return None
+
+
+def parse_image_url(html: str, base_url: str) -> str | None:
+    soup = BeautifulSoup(html, "html.parser")
+    for img in soup.find_all("img"):
+        if GRAPH_ALT_PATTERN.search(img.get("alt", "")) and img.get("src"):
+            return urljoin(base_url.rstrip("/") + "/", img["src"])
+    return None
+
+
 def _unwrap(payload):
     if isinstance(payload, dict):
         for key in ("results", "items", "data", "houses"):
@@ -205,19 +254,15 @@ class HoeClient:
                 await asyncio.sleep(delay)
         raise HoeUnavailable(last_error)
 
-    async def fetch_graph_url(self) -> str | None:
-        """URL актуального зображення з графіком (ГПВ) або None."""
+    async def fetch_graphs(self) -> Graphs | None:
+        """Один запит до сторінки графіків → картинка і/або текст. None — сторінка недоступна."""
         try:
             r = await self._client.get(self.base_url + GRAPH_PAGE_PATH)
             r.raise_for_status()
         except httpx.HTTPError as exc:
             log.warning("Не вдалось завантажити сторінку графіків: %s", exc)
             return None
-        soup = BeautifulSoup(r.text, "html.parser")
-        for img in soup.find_all("img"):
-            if GRAPH_ALT_PATTERN.search(img.get("alt", "")) and img.get("src"):
-                return urljoin(self.base_url + "/", img["src"])
-        return None
+        return Graphs(image_url=parse_image_url(r.text, self.base_url), text=parse_text_schedule(r.text))
 
     async def download(self, url: str) -> bytes:
         r = await self._client.get(url)

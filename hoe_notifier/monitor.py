@@ -7,6 +7,7 @@ import logging
 import random
 import time
 from collections import defaultdict
+from dataclasses import dataclass
 from typing import Awaitable, Callable
 
 from .db import AddressState, Database, Subscription
@@ -20,7 +21,21 @@ SUBJECT_CHANGED = "Змінились погодинні відключення!
 SUBJECT_NONE = "Погодинних відключень немає!"
 FAILURE_ALERT_AFTER = 3  # поспіль невдалих циклів, перш ніж писати адміну
 FAIL_FAST_AFTER = 3      # скільки адрес поспіль мають не відповісти, щоб перервати цикл
+TEXT_GRAPH_SUBJECT = "Графік погодинних відключень"
 MANUAL_REFRESH_MAX_AGE = 60  # /check та додавання адреси не б'ють у сайт частіше, ніж раз на стільки секунд
+
+
+@dataclass
+class GraphReport:
+    """Підсумок розсилки графіка (для адмін-панелі та логів)."""
+    page_ok: bool = True        # сторінку графіків вдалось завантажити
+    image_found: bool = False   # на сторінці є картинка
+    text_found: bool = False    # на сторінці є текстовий графік
+    targets: int = 0            # чатів із увімкненим «Графіком»
+    image_sent: int = 0         # скільком чатам доставлено картинку
+    text_sent: int = 0          # скільком чатам доставлено текст
+    error: str | None = None
+    text: str | None = None     # текст графіка, як він на сайті
 
 
 def describe_state(state: AddressState | None) -> str:
@@ -100,16 +115,19 @@ class Monitor:
         await self._broadcast(self.db.event_subscribers(street_id, house), subject, body)
         return parsed
 
-    async def _send(self, sub: Subscription, method: str, *args, **kwargs) -> None:
-        """Доставка одному адресату: недоступного — відписуємо, перенесеному (group→supergroup) — переносимо."""
+    async def _send(self, sub: Subscription, method: str, *args, **kwargs) -> bool:
+        """Доставка одному адресату. True — доставлено.
+
+        Недоступного адресата відписуємо, перенесеному (group→supergroup) — переносимо підписки.
+        """
         sink = self.sinks.get(sub.channel)
         if sink is None:
             log.warning("Немає каналу доставки %r для підписки %s", sub.channel, sub.id)
-            return
+            return False
         for _ in range(2):
             try:
                 await getattr(sink, method)(sub.target, *args, **kwargs)
-                return
+                return True
             except TargetMigrated as moved:
                 log.warning("Чат %s перенесено на %s — оновлюю підписки", sub.target, moved.new_target)
                 self.db.move_target(sub.channel, sub.target, moved.new_target)
@@ -118,34 +136,63 @@ class Monitor:
                 removed = self.db.delete_target(sub.channel, sub.target)
                 log.warning("Адресат %s/%s недоступний, видалено підписок: %d (%s)",
                             sub.channel, sub.target, removed, exc)
-                return
+                return False
             except Exception:
                 log.exception("Не вдалось надіслати повідомлення %s/%s", sub.channel, sub.target)
-                return
+                return False
+        return False
 
     async def _broadcast(self, subs: list[Subscription], subject: str, body: str) -> None:
         for sub in subs:
             await self._send(sub, "send_text", subject, sub.label, body, silent=sub.silent)
             await asyncio.sleep(self.send_delay)
 
-    # --- графіки --------------------------------------------------------
-    async def check_graphs(self) -> None:
+    # --- графіки (картинка та/або текст) ---------------------------------
+    async def send_graphs(self, *, image: bool = True, text: bool = True, force: bool = False) -> GraphReport:
+        """Надсилає графік підписникам із увімкненим «Графіком».
+
+        Без `force` — лише якщо він змінився з минулого разу (картинка — за URL, текст — за вмістом).
+        `force=True` — розсилка вручну з адмін-панелі, незалежно від змін.
+        """
+        report = GraphReport()
+        graphs = await self.hoe.fetch_graphs()
+        if graphs is None:
+            report.page_ok = False
+            return report
         targets = self.db.graph_targets()
-        url = await self.hoe.fetch_graph_url()
-        if not url or url == self.db.kv_get("last_image_url"):
-            return
-        if not targets:
-            self.db.kv_set("last_image_url", url)
-            return
-        try:
-            data = await self.hoe.download(url)
-        except Exception as exc:
-            log.warning("Не вдалось завантажити графік %s: %s", url, exc)
-            return  # last_image_url не оновлюємо — спробуємо в наступному циклі
+        report.targets = len(targets)
+        report.image_found, report.text_found, report.text = bool(graphs.image_url), bool(graphs.text), graphs.text
+
+        if image and graphs.image_url and (force or graphs.image_url != self.db.kv_get("last_image_url")):
+            await self._publish_image(graphs.image_url, targets, report)
+        if text and graphs.text and (force or graphs.text != self.db.kv_get("last_text_graph")):
+            await self._publish_text(graphs.text, targets, report)
+        return report
+
+    async def _publish_image(self, url: str, targets: list[Subscription], report: GraphReport) -> None:
+        data = b""
+        if targets:
+            try:
+                data = await self.hoe.download(url)
+            except Exception as exc:
+                log.warning("Не вдалось завантажити графік %s: %s", url, exc)
+                report.error = "не вдалось завантажити картинку"
+                return  # last_image_url не оновлюємо — спробуємо в наступному циклі
         for sub in targets:
-            await self._send(sub, "send_photo", data, silent=sub.silent)
+            if await self._send(sub, "send_photo", data, silent=sub.silent):
+                report.image_sent += 1
             await asyncio.sleep(self.send_delay)
         self.db.kv_set("last_image_url", url)
+
+    async def _publish_text(self, text: str, targets: list[Subscription], report: GraphReport) -> None:
+        for sub in targets:
+            if await self._send(sub, "send_text", TEXT_GRAPH_SUBJECT, "", text, silent=sub.silent, pre=False):
+                report.text_sent += 1
+            await asyncio.sleep(self.send_delay)
+        self.db.kv_set("last_text_graph", text)
+
+    async def check_graphs(self) -> None:
+        await self.send_graphs()
 
     # --- цикл -----------------------------------------------------------
     async def poll_once(self) -> None:
