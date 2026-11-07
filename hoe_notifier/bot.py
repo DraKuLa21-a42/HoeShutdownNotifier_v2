@@ -21,7 +21,8 @@ from aiogram.types import (
 from .config import Settings
 from .db import Database, Subscription
 from .hoe import HoeClient, SearchUnavailable, match_house, suggest_houses
-from .monitor import MANUAL_REFRESH_MAX_AGE, TEXT_GRAPH_SUBJECT, Monitor, describe_state
+from .monitor import MANUAL_REFRESH_MAX_AGE, TEXT_GRAPH_SUBJECT, Monitor, describe_state, label_for
+from .queues import QUEUES, filter_schedule, normalize_queue
 from .sinks import fit_body, render_message
 
 log = logging.getLogger(__name__)
@@ -30,11 +31,15 @@ HELP = (
     "<b>Сповіщення про погодинні відключення (Хмельницькобленерго)</b>\n\n"
     "/add — додати адресу: населений пункт → вулиця → будинок\n"
     "/add_id <code>&lt;streetId&gt; &lt;будинок&gt; [назва]</code> — додати адресу за ID вулиці\n"
-    "/list — мої адреси та налаштування (сповіщення, графіки, звук)\n"
+    "/list — мої адреси та налаштування (сповіщення, графік, звук, черга)\n"
     "/check — перевірити всі мої адреси зараз\n"
-    "/graph — показати актуальний графік (картинку та/або текст — як опубліковано на сайті)\n"
+    "/graph — показати актуальний графік (картинку та/або текст); якщо вказано чергу — лише для неї, "
+    "<code>/graph all</code> — повністю\n"
     "/admin — панель адміністратора (лише для ADMIN_IDS)\n"
     "/cancel — скасувати поточну дію\n\n"
+    "<b>Фільтр за чергою.</b> У /list натисни «🔢 Черга» біля адреси й обери свою підчергу (1.1 – 6.2): "
+    "бот надсилатиме лише відключення твоєї черги (і текстовий графік лише з нею). "
+    "Одразу під час додавання: <code>/add_id 123456 12 Дім --queue=1.1</code>.\n\n"
     "<b>Сповіщення в канал або групу.</b> Додай бота в канал адміністратором з правом "
     "«Публікація повідомлень» і дописуй до команди <code>--to=&lt;ID каналу або @username&gt;</code>:\n"
     "<code>/add_id 123456 12 Дім --to=-1001234567890</code>\n"
@@ -45,7 +50,9 @@ HELP = (
 
 # На мобільних "--" часто автозамінюється на тире, тому приймаємо і його.
 TO_RE = re.compile(r"(?:^|\s)(?:--|—|–)to(?:=|\s+)(\S+)", re.IGNORECASE)
+QUEUE_RE = re.compile(r"(?:^|\s)(?:--|—|–)queue(?:=|\s+)(\S+)", re.IGNORECASE)
 USERNAME_RE = re.compile(r"@[A-Za-z][A-Za-z0-9_]{3,31}")
+QUEUES_HINT = f"{QUEUES[0]} … {QUEUES[-1]}"
 
 
 class AddFlow(StatesGroup):
@@ -69,6 +76,15 @@ def split_to(args: str | None) -> tuple[str, str | None]:
     return (args[: m.start()] + args[m.end():]).strip(), m.group(1)
 
 
+def split_queue(args: str | None) -> tuple[str, str | None]:
+    """Відокремлює `--queue=...` від решти аргументів команди."""
+    args = args or ""
+    m = QUEUE_RE.search(args)
+    if not m:
+        return args.strip(), None
+    return (args[: m.start()] + args[m.end():]).strip(), m.group(1)
+
+
 def sub_keyboard(sub: Subscription) -> InlineKeyboardMarkup | None:
     if sub.source == "config":
         return None
@@ -81,7 +97,21 @@ def sub_keyboard(sub: Subscription) -> InlineKeyboardMarkup | None:
         InlineKeyboardButton(text=f"{'🔕' if sub.silent else '🔔'} Звук", callback_data=f"sub:{sub.id}:silent"),
         InlineKeyboardButton(text="🗑 Видалити", callback_data=f"sub:{sub.id}:del"),
     ]
-    return InlineKeyboardMarkup(inline_keyboard=[row1, row2])
+    row3 = [InlineKeyboardButton(text=f"🔢 Черга: {sub.queue or 'усі'}", callback_data=f"sub:{sub.id}:queue")]
+    return InlineKeyboardMarkup(inline_keyboard=[row1, row2, row3])
+
+
+def queue_keyboard(sub: Subscription) -> InlineKeyboardMarkup:
+    """Вибір підчерги: по дві в рядку (1.1 1.2 / 2.1 2.2 …), «усі» та «назад»."""
+    mark = lambda q: "✅ " if sub.queue == q else ""  # noqa: E731
+    rows = [
+        [InlineKeyboardButton(text=f"{mark(q)}{q}", callback_data=f"q:{sub.id}:{q}") for q in QUEUES[i:i + 2]]
+        for i in range(0, len(QUEUES), 2)
+    ]
+    rows.append([InlineKeyboardButton(text=f"{'✅ ' if sub.queue is None else ''}Усі черги (без фільтра)",
+                                      callback_data=f"q:{sub.id}:all")])
+    rows.append([InlineKeyboardButton(text="↩ Назад", callback_data=f"q:{sub.id}:back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def sub_text(sub: Subscription, where: str | None = None) -> str:
@@ -165,7 +195,8 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
         return chat.id, chat.title or chat.username or str(chat.id)
 
     async def finish_add(message: Message, user_id: int, street_id: str, house: str, label: str,
-                         target: int | None = None, target_title: str | None = None) -> None:
+                         target: int | None = None, target_title: str | None = None,
+                         queue: str | None = None) -> None:
         external = target is not None and target != message.chat.id
         chat_id = str(target if external else message.chat.id)
         if db.count_for_target("tg", chat_id) >= settings.max_addresses_per_chat:
@@ -179,14 +210,15 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
         # Спочатку оновлюємо стан (розсилка існуючим підписникам), потім підписуємо — без дублів.
         await monitor.refresh_address(street_id, house, max_age=MANUAL_REFRESH_MAX_AGE)
         state = db.get_state(street_id, house)
-        status = describe_state(state) if state else (
+        status = describe_state(state, queue) if state else (
             "Не вдалося отримати дані з сайту зараз — повідомлю, щойно вони з'являться.")
 
         if external:
             # Перше повідомлення в канал водночас перевіряє, що публікація справді працює.
             try:
                 await message.bot.send_message(
-                    int(chat_id), f"📍 <b>{escape(label)}</b>\n\n<pre>{escape(status)}</pre>",
+                    int(chat_id), f"📍 <b>{escape(label)}{' · черга ' + queue if queue else ''}</b>"
+                    f"\n\n<pre>{escape(status)}</pre>",
                     disable_notification=settings.default_silent)
             except TelegramAPIError as exc:
                 log.warning("Не вдалося написати в %s: %s", chat_id, exc)
@@ -194,17 +226,29 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
                                      "Адресу не додано.")
                 return
 
-        db.add_subscription(
+        sub, _ = db.add_subscription(
             "tg", chat_id, street_id, house, label,
-            graphs=settings.default_graphs, silent=settings.default_silent, owner_id=user_id,
+            graphs=settings.default_graphs, silent=settings.default_silent, owner_id=user_id, queue=queue,
         )
+        hint = ("Налаштування — кнопками нижче або в /list." if queue else
+                "Щоб отримувати лише відключення своєї черги, натисни «🔢 Черга».")
         if external:
-            await message.answer(f"✅ Додано в «{escape(target_title or chat_id)}»: <b>{escape(label)}</b>\n"
-                                 "Налаштування (графік, звук) — у /list.")
+            await message.answer(f"✅ Додано в «{escape(target_title or chat_id)}»: <b>{escape(label)}</b>\n{hint}",
+                                 reply_markup=sub_keyboard(sub))
         else:
             await message.answer(
-                f"✅ Додано: <b>{escape(label)}</b>\n\nПоточний стан:\n<pre>{escape(status)}</pre>\n"
-                "Налаштування (графік, звук) — у /list.")
+                f"✅ Додано: <b>{escape(label)}</b>\n\nПоточний стан:\n<pre>{escape(status)}</pre>\n{hint}",
+                reply_markup=sub_keyboard(sub))
+
+    async def parse_queue_option(message: Message, raw: str | None) -> tuple[str | None, bool]:
+        """(черга, ok). ok=False — помилку вже показано користувачу."""
+        if raw is None:
+            return None, True
+        queue = normalize_queue(raw)
+        if queue is None:
+            await message.answer(f"Невідома черга «{escape(raw)}». Доступні підчерги: {QUEUES_HINT} (наприклад, 1.1).")
+            return None, False
+        return queue, True
 
     async def maybe_resolve(message: Message, raw_to: str | None) -> tuple[int | None, str | None, bool]:
         """(target, title, ok). ok=False — помилку вже показано користувачу."""
@@ -260,13 +304,17 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
     async def add(message: Message, command: CommandObject, state: FSMContext) -> None:
         if not await guard(message):
             return
-        _, raw_to = split_to(command.args)
+        rest, raw_to = split_to(command.args)
+        _, raw_queue = split_queue(rest)
+        queue, ok = await parse_queue_option(message, raw_queue)
+        if not ok:
+            return
         target, title, ok = await maybe_resolve(message, raw_to)
         if not ok:
             return
         await state.clear()
         await state.set_state(AddFlow.settlement_query)
-        await state.update_data(target=target, target_title=title)
+        await state.update_data(target=target, target_title=title, queue=queue)
         where = f" (у «{escape(title)}»)" if title else ""
         markup = prompt_markup(message.chat.type)
         last = last_settlement(message.from_user.id)
@@ -373,7 +421,7 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
         await state.clear()
         label = f"{data['settlement_name']}, {data['street_name']}, {house_no}"[:80]
         await finish_add(message, user_id, data["street_id"], house_no, label,
-                         data.get("target"), data.get("target_title"))
+                         data.get("target"), data.get("target_title"), data.get("queue"))
 
     @router.message(StateFilter(AddFlow.house), F.text, ~F.text.startswith("/"))
     async def house(message: Message, state: FSMContext) -> None:
@@ -418,10 +466,14 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
         if not await guard(message):
             return
         rest, raw_to = split_to(command.args)
+        rest, raw_queue = split_queue(rest)
         parts = rest.split(maxsplit=2)
         if len(parts) < 2:
             await message.answer("Формат: <code>/add_id &lt;streetId&gt; &lt;будинок&gt; [назва] "
-                                 "[--to=&lt;ID каналу або @username&gt;]</code>")
+                                 "[--queue=1.1] [--to=&lt;ID каналу або @username&gt;]</code>")
+            return
+        queue, ok = await parse_queue_option(message, raw_queue)
+        if not ok:
             return
         target, title, ok = await maybe_resolve(message, raw_to)
         if not ok:
@@ -429,7 +481,7 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
         street_id, house_no = parts[0], parts[1]
         label = parts[2].strip() if len(parts) > 2 else f"вул. #{street_id}, {house_no}"
         await state.clear()
-        await finish_add(message, message.from_user.id, street_id, house_no, label[:80], target, title)
+        await finish_add(message, message.from_user.id, street_id, house_no, label[:80], target, title, queue)
 
     # --- список і керування -----------------------------------------------
     async def chat_title(bot: Bot, chat_id: str) -> str:
@@ -454,15 +506,13 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
         for sub, where in subs:
             await message.answer(sub_text(sub, where), reply_markup=sub_keyboard(sub))
 
-    @router.callback_query(F.data.regexp(r"^sub:\d+:(events|graphs|silent|del)$"))
-    async def sub_action(cb: CallbackQuery) -> None:
-        _, sub_id, action = cb.data.split(":")
-        sub = db.get_subscription(int(sub_id))
+    async def authorize_sub(cb: CallbackQuery, sub: Subscription | None) -> bool:
+        """Чи може той, хто натиснув кнопку, змінювати цю підписку. Якщо ні — показує причину."""
         chat = cb.message.chat
         user_id = cb.from_user.id
         if sub is None or sub.channel != "tg":
             await cb.answer("Запис не знайдено.", show_alert=True)
-            return
+            return False
         if sub.target == str(chat.id):
             permitted = await can_manage(cb.bot, chat.id, chat.type, user_id)
         else:
@@ -472,17 +522,44 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
                          and await can_manage(cb.bot, int(sub.target), ChatType.CHANNEL, user_id))
         if not permitted:
             await cb.answer("Недостатньо прав або запис не знайдено.", show_alert=True)
-            return
+            return False
         if sub.source == "config":
             await cb.answer("Цей запис керується через addresses.toml.", show_alert=True)
+            return False
+        return True
+
+    @router.callback_query(F.data.regexp(r"^sub:\d+:(events|graphs|silent|queue|del)$"))
+    async def sub_action(cb: CallbackQuery) -> None:
+        _, sub_id, action = cb.data.split(":")
+        sub = db.get_subscription(int(sub_id))
+        if not await authorize_sub(cb, sub):
             return
         if action == "del":
             db.delete_subscription(sub.id)
             await cb.message.edit_text(f"🗑 Видалено: <b>{escape(sub.label)}</b>")
+        elif action == "queue":
+            await cb.message.edit_reply_markup(reply_markup=queue_keyboard(sub))
         else:
             sub = db.toggle(sub.id, action)
             await cb.message.edit_reply_markup(reply_markup=sub_keyboard(sub))
         await cb.answer()
+
+    @router.callback_query(F.data.regexp(r"^q:\d+:(\d\.\d|all|back)$"))
+    async def queue_action(cb: CallbackQuery) -> None:
+        _, sub_id, value = cb.data.split(":")
+        sub = db.get_subscription(int(sub_id))
+        if not await authorize_sub(cb, sub):
+            return
+        toast = None
+        if value != "back":
+            queue = None if value == "all" else normalize_queue(value)
+            if value != "all" and queue is None:
+                await cb.answer(f"Невідома черга. Доступні: {QUEUES_HINT}.", show_alert=True)
+                return
+            sub = db.set_queue(sub.id, queue)
+            toast = f"Черга: {queue}" if queue else "Фільтр за чергою вимкнено"
+        await cb.message.edit_reply_markup(reply_markup=sub_keyboard(sub))
+        await cb.answer(toast)
 
     # --- перегляд ---------------------------------------------------------
     @router.message(Command("check"))
@@ -498,9 +575,11 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
             suffix = "" if parsed else "\n<i>(сайт недоступний, показано останні відомі дані)</i>"
             state = db.get_state(sub.street_id, sub.house)
             await message.answer(
-                f"📍 <b>{escape(sub.label)}</b>\n<pre>{escape(describe_state(state))}</pre>{suffix}")
+                f"📍 <b>{escape(label_for(sub))}</b>\n"
+                f"<pre>{escape(describe_state(state, sub.queue))}</pre>{suffix}")
 
-    async def send_site_graph(message: Message, *, text: bool = True, image: bool = True) -> bool:
+    async def send_site_graph(message: Message, *, text: bool = True, image: bool = True,
+                              queues: frozenset[str] | None = None) -> bool:
         """Показує поточний графік із сайту в цьому чаті. True — щось показано."""
         graphs = await hoe.fetch_graphs()
         if graphs is None:
@@ -508,7 +587,10 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
             return False
         shown = False
         if text and graphs.text:
-            await message.answer(render_message(TEXT_GRAPH_SUBJECT, "", graphs.text, pre=False))
+            body = filter_schedule(graphs.text, queues)
+            if queues and body != graphs.text:
+                body += "\n\nПоказано лише вашу чергу. Повний графік: /graph all"
+            await message.answer(render_message(TEXT_GRAPH_SUBJECT, "", body, pre=False))
             shown = True
         if image and graphs.image_url:
             try:
@@ -524,10 +606,12 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
         return shown
 
     @router.message(Command("graph"))
-    async def graph(message: Message) -> None:
+    async def graph(message: Message, command: CommandObject) -> None:
         if not allowed(message.chat.id, message.from_user.id if message.from_user else 0):
             return
-        await send_site_graph(message)
+        everything = (command.args or "").strip().lower() in {"all", "усі", "все"}
+        queues = None if everything else db.chat_queues("tg", str(message.chat.id))
+        await send_site_graph(message, queues=queues)
 
     # --- панель адміністратора --------------------------------------------
     def stats_text() -> str:
@@ -536,6 +620,7 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
                 if monitor.last_poll_at else "—")
         return (f"Чатів: {s['targets']}\nПідписок: {s['subscriptions']}\nУнікальних адрес: {s['addresses']}\n"
                 f"Чатів із графіком: {len(db.graph_targets())}\n"
+                f"Адрес із фільтром за чергою: {s['with_queue']}\n"
                 f"Останній цикл: {last} ({monitor.last_poll_summary})\n"
                 f"Інтервал: {settings.poll_interval} с")
 
@@ -600,7 +685,10 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
                     await cb.answer(f"На сайті зараз немає: {kind}.", show_alert=True)
                 else:
                     preview = ("\n\n" + escape(fit_body(graphs.text, 1200))) if as_text else ""
-                    n = len(db.graph_targets())
+                    targets = db.graph_targets()
+                    n = len(targets)
+                    if as_text and any(t.queues for t in targets):
+                        preview += "\n\n<i>Чатам із вказаною чергою піде лише рядки їхніх черг.</i>"
                     kb = InlineKeyboardMarkup(inline_keyboard=[[
                         InlineKeyboardButton(text="✅ Так, розіслати", callback_data=f"adm:{action}:yes"),
                         InlineKeyboardButton(text="✖ Скасувати", callback_data=f"adm:{action}:no"),

@@ -4,6 +4,8 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+from .queues import QUEUES, normalize_queue
+
 try:
     import tomllib
 except ModuleNotFoundError:  # Python < 3.11
@@ -29,9 +31,15 @@ def load_addresses(path: Path, *, default_silent: bool = True, default_graphs: b
                 log.warning("addresses.toml #%d: канал %s не налаштований, запис пропущено", i, channel)
                 continue
             street_id, house, target = str(raw["street_id"]), str(raw["house"]), str(raw["target"])
+            queue = None
+            if raw.get("queue") not in (None, ""):
+                queue = normalize_queue(raw["queue"])
+                if queue is None:
+                    raise ValueError(f"queue має бути однією з {QUEUES[0]} … {QUEUES[-1]}, а не {raw['queue']!r}")
             entries.append({
                 "channel": channel, "target": target, "street_id": street_id, "house": house,
                 "label": str(raw.get("name") or f"вул. #{street_id}, {house}"),
+                "queue": queue,
                 "events": bool(raw.get("events", True)),
                 "graphs": bool(raw.get("graphs", default_graphs)),
                 "silent": bool(raw.get("silent", default_silent)),

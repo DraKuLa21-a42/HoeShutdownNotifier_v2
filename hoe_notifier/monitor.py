@@ -10,8 +10,9 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Awaitable, Callable
 
-from .db import AddressState, Database, Subscription
+from .db import AddressState, Database, GraphTarget, Subscription
 from .hoe import NO_OUTAGES, HoeClient, HoeUnavailable, ParseStatus, Parsed, parse_events
+from .queues import filter_schedule, outage_view
 from .sinks import Sink, TargetGone, TargetMigrated
 
 log = logging.getLogger(__name__)
@@ -38,10 +39,20 @@ class GraphReport:
     text: str | None = None     # текст графіка, як він на сайті
 
 
-def describe_state(state: AddressState | None) -> str:
+def subject_none(queue: str | None = None) -> str:
+    return SUBJECT_NONE if not queue else f"Погодинних відключень для черги {queue} немає!"
+
+
+def label_for(sub: Subscription) -> str:
+    """Підпис адреси в повідомленні; для адрес із фільтром — із зазначенням черги."""
+    return sub.label if not sub.queue else f"{sub.label} · черга {sub.queue}"
+
+
+def describe_state(state: AddressState | None, queue: str | None = None) -> str:
+    """Поточний стан адреси простим текстом; `queue` — показати лише записи цієї черги."""
     if state is None:
         return "Дані поки не отримано."
-    return SUBJECT_NONE if state.last_text == NO_OUTAGES else state.last_text
+    return outage_view(state.last_text, queue) or subject_none(queue)
 
 
 class Monitor:
@@ -101,28 +112,23 @@ class Monitor:
 
         current = parsed.text if parsed.status is ParseStatus.OUTAGES else NO_OUTAGES
         state = self.db.get_state(street_id, house)
-        previous = state.last_text if state else ""
+        previous = state.last_text if state else None
         if current == previous:
             return parsed
 
-        if parsed.status is ParseStatus.OUTAGES:
-            subject = SUBJECT_CHANGED if previous and previous != NO_OUTAGES else SUBJECT_NEW
-            body = parsed.text
-        else:
-            subject, body = SUBJECT_NONE, ""
         # стан зберігаємо до розсилки: збій доставки не має спричиняти нескінченні повтори
         self.db.save_state(street_id, house, current)
-        await self._broadcast(self.db.event_subscribers(street_id, house), subject, body)
+        await self._broadcast_changes(self.db.event_subscribers(street_id, house), previous, current)
         return parsed
 
-    async def _send(self, sub: Subscription, method: str, *args, **kwargs) -> bool:
+    async def _send(self, sub: Subscription | GraphTarget, method: str, *args, **kwargs) -> bool:
         """Доставка одному адресату. True — доставлено.
 
         Недоступного адресата відписуємо, перенесеному (group→supergroup) — переносимо підписки.
         """
         sink = self.sinks.get(sub.channel)
         if sink is None:
-            log.warning("Немає каналу доставки %r для підписки %s", sub.channel, sub.id)
+            log.warning("Немає каналу доставки %r для %s", sub.channel, sub.target)
             return False
         for _ in range(2):
             try:
@@ -142,9 +148,21 @@ class Monitor:
                 return False
         return False
 
-    async def _broadcast(self, subs: list[Subscription], subject: str, body: str) -> None:
+    async def _broadcast_changes(self, subs: list[Subscription], previous: str | None, current: str) -> None:
+        """Кожному підписнику — лише те, що стосується його черги, і лише якщо це змінилось.
+
+        `previous` = None — адресу бачимо вперше (пишемо всім, навіть якщо для черги відключень немає).
+        """
         for sub in subs:
-            await self._send(sub, "send_text", subject, sub.label, body, silent=sub.silent)
+            new_view = outage_view(current, sub.queue)
+            old_view = outage_view(previous, sub.queue)
+            if previous is not None and new_view == old_view:
+                continue  # змінилось лише те, що цю підписку не стосується
+            if new_view:
+                subject = SUBJECT_CHANGED if old_view else SUBJECT_NEW
+            else:
+                subject = subject_none(sub.queue)
+            await self._send(sub, "send_text", subject, label_for(sub), new_view, silent=sub.silent)
             await asyncio.sleep(self.send_delay)
 
     # --- графіки (картинка та/або текст) ---------------------------------
@@ -166,10 +184,10 @@ class Monitor:
         if image and graphs.image_url and (force or graphs.image_url != self.db.kv_get("last_image_url")):
             await self._publish_image(graphs.image_url, targets, report)
         if text and graphs.text and (force or graphs.text != self.db.kv_get("last_text_graph")):
-            await self._publish_text(graphs.text, targets, report)
+            await self._publish_text(graphs.text, targets, report, force=force)
         return report
 
-    async def _publish_image(self, url: str, targets: list[Subscription], report: GraphReport) -> None:
+    async def _publish_image(self, url: str, targets: list[GraphTarget], report: GraphReport) -> None:
         data = b""
         if targets:
             try:
@@ -184,10 +202,17 @@ class Monitor:
             await asyncio.sleep(self.send_delay)
         self.db.kv_set("last_image_url", url)
 
-    async def _publish_text(self, text: str, targets: list[Subscription], report: GraphReport) -> None:
-        for sub in targets:
-            if await self._send(sub, "send_text", TEXT_GRAPH_SUBJECT, "", text, silent=sub.silent, pre=False):
+    async def _publish_text(self, text: str, targets: list[GraphTarget], report: GraphReport, *,
+                            force: bool = False) -> None:
+        """Кожен чат отримує графік лише своїх черг; якщо для них нічого не змінилось — мовчимо."""
+        for target in targets:
+            body = filter_schedule(text, target.queues)
+            key = f"graph_text:{target.channel}:{target.target}"
+            if not force and body == self.db.kv_get(key):
+                continue  # змінились лише рядки інших черг
+            if await self._send(target, "send_text", TEXT_GRAPH_SUBJECT, "", body, silent=target.silent, pre=False):
                 report.text_sent += 1
+                self.db.kv_set(key, body)
             await asyncio.sleep(self.send_delay)
         self.db.kv_set("last_text_graph", text)
 

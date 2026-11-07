@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     events     INTEGER NOT NULL DEFAULT 1,         -- слати погодинні відключення
     graphs     INTEGER NOT NULL DEFAULT 0,         -- слати картинку з графіком
     silent     INTEGER NOT NULL DEFAULT 1,         -- без звуку (лише Telegram)
+    queue      TEXT,                               -- підчерга ГПВ (1.1 … 6.2); NULL — усі черги
     source     TEXT    NOT NULL DEFAULT 'bot',     -- bot | config
     owner_id   INTEGER,
     created_at INTEGER NOT NULL,
@@ -49,6 +50,16 @@ class Subscription:
     silent: bool
     source: str
     owner_id: int | None
+    queue: str | None = None
+
+
+@dataclass(frozen=True)
+class GraphTarget:
+    """Чат/канал, якому надсилати графік. `queues` — об'єднання черг його адрес; None — без фільтра."""
+    channel: str
+    target: str
+    silent: bool
+    queues: frozenset[str] | None
 
 
 @dataclass(frozen=True)
@@ -64,7 +75,7 @@ def _sub(row: sqlite3.Row) -> Subscription:
         id=row["id"], channel=row["channel"], target=row["target"],
         street_id=row["street_id"], house=row["house"], label=row["label"],
         events=bool(row["events"]), graphs=bool(row["graphs"]), silent=bool(row["silent"]),
-        source=row["source"], owner_id=row["owner_id"],
+        source=row["source"], owner_id=row["owner_id"], queue=row["queue"],
     )
 
 
@@ -77,7 +88,14 @@ class Database:
         self._conn.row_factory = sqlite3.Row
         with self._lock:
             self._conn.executescript(SCHEMA)
+            self._migrate()
             self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Додає колонки, яких немає в базах, створених старішими версіями."""
+        cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(subscriptions)")}
+        if "queue" not in cols:
+            self._conn.execute("ALTER TABLE subscriptions ADD COLUMN queue TEXT")
 
     def close(self) -> None:
         with self._lock:
@@ -87,15 +105,15 @@ class Database:
     def add_subscription(
         self, channel: str, target: str, street_id: str, house: str, label: str,
         *, events: bool = True, graphs: bool = False, silent: bool = True,
-        source: str = "bot", owner_id: int | None = None,
+        source: str = "bot", owner_id: int | None = None, queue: str | None = None,
     ) -> tuple[Subscription, bool]:
         with self._lock:
             cur = self._conn.execute(
                 "INSERT OR IGNORE INTO subscriptions "
-                "(channel,target,street_id,house,label,events,graphs,silent,source,owner_id,created_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                "(channel,target,street_id,house,label,events,graphs,silent,source,owner_id,created_at,queue) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (channel, str(target), street_id, house, label, int(events), int(graphs),
-                 int(silent), source, owner_id, int(time.time())),
+                 int(silent), source, owner_id, int(time.time()), queue),
             )
             self._conn.commit()
             created = cur.rowcount > 0
@@ -149,6 +167,13 @@ class Database:
             self._conn.commit()
         return cur.rowcount > 0
 
+    def set_queue(self, sub_id: int, queue: str | None) -> Subscription | None:
+        """Задає підчергу адреси (None — усі черги)."""
+        with self._lock:
+            self._conn.execute("UPDATE subscriptions SET queue=? WHERE id=?", (queue, sub_id))
+            self._conn.commit()
+        return self.get_subscription(sub_id)
+
     def toggle(self, sub_id: int, field: str) -> Subscription | None:
         if field not in TOGGLE_FIELDS:
             raise ValueError(field)
@@ -193,13 +218,34 @@ class Database:
             ).fetchall()
         return [_sub(r) for r in rows]
 
-    def graph_targets(self) -> list[Subscription]:
-        """По одній підписці на (channel,target), яка просить графіки."""
+    def graph_targets(self) -> list[GraphTarget]:
+        """Чати, які просять графік: по одному запису на (channel, target).
+
+        Черги — об'єднання черг усіх їхніх адрес із ввімкненим графіком; якщо хоч одна адреса без черги,
+        фільтра немає (чат отримує графік повністю).
+        """
         with self._lock:
             rows = self._conn.execute(
-                "SELECT * FROM subscriptions WHERE graphs=1 GROUP BY channel, target"
+                "SELECT channel, target, silent, queue FROM subscriptions WHERE graphs=1 ORDER BY id"
             ).fetchall()
-        return [_sub(r) for r in rows]
+        grouped: dict[tuple[str, str], list[sqlite3.Row]] = {}
+        for r in rows:
+            grouped.setdefault((r["channel"], r["target"]), []).append(r)
+        return [
+            GraphTarget(
+                channel=channel, target=target,
+                silent=all(bool(r["silent"]) for r in group),
+                queues=None if any(r["queue"] is None for r in group) else frozenset(r["queue"] for r in group),
+            )
+            for (channel, target), group in grouped.items()
+        ]
+
+    def chat_queues(self, channel: str, target: str) -> frozenset[str] | None:
+        """Черги всіх адрес чату; None — фільтра немає (немає адрес або хоч в одній черга не задана)."""
+        subs = self.list_subscriptions(channel, target)
+        if not subs or any(s.queue is None for s in subs):
+            return None
+        return frozenset(s.queue for s in subs)
 
     def sync_config_subscriptions(self, entries: list[dict]) -> None:
         """Приводить підписки з source='config' у відповідність до addresses.toml."""
@@ -210,13 +256,13 @@ class Database:
             with self._lock:
                 self._conn.execute(
                     "INSERT INTO subscriptions "
-                    "(channel,target,street_id,house,label,events,graphs,silent,source,created_at) "
-                    "VALUES (?,?,?,?,?,?,?,?, 'config', ?) "
+                    "(channel,target,street_id,house,label,events,graphs,silent,source,created_at,queue) "
+                    "VALUES (?,?,?,?,?,?,?,?, 'config', ?, ?) "
                     "ON CONFLICT(channel,target,street_id,house) DO UPDATE SET "
                     "label=excluded.label, events=excluded.events, graphs=excluded.graphs, "
-                    "silent=excluded.silent, source='config'",
+                    "silent=excluded.silent, queue=excluded.queue, source='config'",
                     (*key[:2], key[2], key[3], e["label"], int(e["events"]), int(e["graphs"]),
-                     int(e["silent"]), int(time.time())),
+                     int(e["silent"]), int(time.time()), e.get("queue")),
                 )
                 self._conn.commit()
         with self._lock:
@@ -264,6 +310,7 @@ class Database:
             c = self._conn
             return {
                 "subscriptions": c.execute("SELECT COUNT(*) FROM subscriptions").fetchone()[0],
+                "with_queue": c.execute("SELECT COUNT(*) FROM subscriptions WHERE queue IS NOT NULL").fetchone()[0],
                 "targets": c.execute(
                     "SELECT COUNT(*) FROM (SELECT DISTINCT channel,target FROM subscriptions)").fetchone()[0],
                 "addresses": c.execute(
