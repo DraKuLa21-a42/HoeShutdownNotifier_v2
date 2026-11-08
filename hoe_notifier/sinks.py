@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from html import escape
 from typing import Protocol
 
@@ -20,6 +21,12 @@ class TargetMigrated(Exception):
         super().__init__(new_target)
         self.new_target = new_target
 
+
+class ChannelError(Exception):
+    """Канал не вдалося знайти або перевірити; текст призначений для користувача."""
+
+
+SLACK_ID_RE = re.compile(r"[CGD][A-Z0-9]{8,}")
 
 TG_BODY_LIMIT = 3500      # ліміт Telegram на повідомлення — 4096 символів разом із розміткою
 SLACK_BODY_LIMIT = 2800   # ліміт тексту блоку Slack — 3000
@@ -94,30 +101,116 @@ class TelegramSink:
         )
 
 
+SLACK_GONE_ERRORS = {"channel_not_found", "not_in_channel", "is_archived",
+                     "invalid_auth", "token_revoked", "token_expired", "account_inactive"}
+
+
 class SlackSink:
-    def __init__(self, token: str) -> None:
-        from slack_sdk import WebClient
-        self.client = WebClient(token=token)
+    """Надсилає у Slack від імені ботів, яких користувачі підключили самі.
+
+    Адресат має вигляд «<id бота в базі>/<ID каналу>». Адресат без «/» (запис з addresses.toml)
+    використовує глобальний `SLACK_TOKEN`.
+    """
+
+    def __init__(self, token: str | None = None, db=None) -> None:
+        self.token = token
+        self.db = db
+        self._clients: dict = {}
+
+    def _client(self, token: str):
+        if token not in self._clients:
+            from slack_sdk import WebClient
+            self._clients[token] = WebClient(token=token)
+        return self._clients[token]
+
+    def _client_and_channel(self, target: str):
+        if "/" in target:
+            bot_id, channel = target.split("/", 1)
+            bot = self.db.get_slack_bot(int(bot_id)) if self.db and bot_id.isdigit() else None
+            if bot is None:
+                raise TargetGone("Slack-бота видалено")
+            return self._client(bot.token), channel
+        if not self.token:
+            raise TargetGone("не задано SLACK_TOKEN")
+        return self._client(self.token), target
 
     async def _run(self, func, **kwargs):
         from slack_sdk.errors import SlackApiError
         try:
             return await asyncio.to_thread(func, **kwargs)
         except SlackApiError as exc:
-            if exc.response.get("error") in {"channel_not_found", "not_in_channel", "is_archived"}:
+            if exc.response.get("error") in SLACK_GONE_ERRORS:
                 raise TargetGone(str(exc)) from exc
             raise
+
+    async def inspect(self, token: str) -> tuple[str, str]:
+        """Перевіряє токен бота: (назва воркспейсу, ім'я бота). ChannelError — токен непридатний."""
+        from slack_sdk.errors import SlackApiError
+        try:
+            info = await asyncio.to_thread(self._client(token).auth_test)
+        except SlackApiError as exc:
+            raise ChannelError("Slack не прийняв цей токен (перевір, що це «Bot User OAuth Token», "
+                               "xoxb-…, і що застосунок встановлено у воркспейс).") from exc
+        return info.get("team") or "Slack", info.get("user") or "bot"
+
+    async def resolve(self, bot_id: int, ref: str) -> tuple[str, str]:
+        """Перетворює ID (C0123…) або #назву на (ID каналу, назва для показу) від імені бота `bot_id`."""
+        from slack_sdk.errors import SlackApiError
+        bot = self.db.get_slack_bot(bot_id)
+        if bot is None:
+            raise ChannelError("Slack-бота не знайдено.")
+        client = self._client(bot.token)
+        ref = ref.strip()
+        try:
+            if SLACK_ID_RE.fullmatch(ref):
+                try:
+                    info = await asyncio.to_thread(client.conversations_info, channel=ref)
+                except SlackApiError as exc:
+                    if exc.response.get("error") == "missing_scope":
+                        return ref, ref          # назву дізнатися не можемо, але ID достатньо
+                    raise
+                ch = info["channel"]
+                return ch["id"], f"#{ch['name']}" if ch.get("name") else ref
+            name = ref.lstrip("#").lower()
+            for types in ("public_channel,private_channel", "public_channel"):
+                try:
+                    cursor = None
+                    while True:
+                        page = await asyncio.to_thread(
+                            client.conversations_list, types=types, exclude_archived=True,
+                            limit=200, cursor=cursor)
+                        for ch in page["channels"]:
+                            if ch.get("name") == name:
+                                return ch["id"], f"#{ch['name']}"
+                        cursor = (page.get("response_metadata") or {}).get("next_cursor")
+                        if not cursor:
+                            break
+                    raise ChannelError(f"Канал #{name} не знайдено (приватні канали бот бачить, лише якщо його "
+                                       "запрошено). Вкажи ID каналу, наприклад C0123ABCD.")
+                except SlackApiError as exc:
+                    if exc.response.get("error") != "missing_scope" or types == "public_channel":
+                        if exc.response.get("error") == "missing_scope":
+                            raise ChannelError("Для пошуку за назвою потрібні права channels:read "
+                                               "(або вкажи ID каналу).") from exc
+                        raise
+        except SlackApiError as exc:
+            err = exc.response.get("error")
+            if err in {"channel_not_found", "invalid_arguments"}:
+                raise ChannelError("Не знайшов такий канал у Slack. Перевір ID та що бота запрошено в канал.") from exc
+            raise ChannelError(f"Slack відповів помилкою: {err}.") from exc
 
     async def send_text(self, target, subject, label, body, *, silent, pre=True):
         body = fit_body(body, SLACK_BODY_LIMIT)
         head = "\n".join(x for x in (f"*{subject}*" if subject else "", f"📍 {label}" if label else "") if x)
         shown = (f"```{body}```" if pre else body) if body else ""
         text = head + ("\n" if head and shown else "") + shown
+        client, channel = self._client_and_channel(target)
         await self._run(
-            self.client.chat_postMessage, channel=target,
+            client.chat_postMessage, channel=channel,
             text=(f"{subject} {label}".strip() or body[:100]),
             blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": text}}],
         )
 
     async def send_photo(self, target, data, *, silent):
-        await self._run(self.client.files_upload_v2, channel=target, content=data, filename="graph.png")
+        client, channel = self._client_and_channel(target)
+        await self._run(client.files_upload_v2, channel=channel, content=data, filename="graph.png")

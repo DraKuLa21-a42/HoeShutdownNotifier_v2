@@ -69,8 +69,9 @@ async def run() -> int:
 
         bot = Bot(settings.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
         sinks["tg"] = TelegramSink(bot)
-    if settings.slack_token:
-        sinks["slack"] = SlackSink(settings.slack_token)
+    # Slack-боти підключають самі користувачі через /slack, тож Slack-канал доставки є завжди;
+    # SLACK_TOKEN — лише необов'язковий спільний токен для записів з addresses.toml.
+    sinks["slack"] = SlackSink(settings.slack_token, db)
 
     async def admin_notify(text: str) -> None:
         if "tg" not in sinks:
@@ -83,7 +84,8 @@ async def run() -> int:
 
     entries = load_addresses(
         settings.addresses_file, default_silent=settings.default_silent,
-        default_graphs=settings.default_graphs, available_channels=set(sinks),
+        default_graphs=settings.default_graphs,
+        available_channels=set(sinks) - (set() if settings.slack_token else {"slack"}),
     )
     db.sync_config_subscriptions(entries)
     log.info("Адрес з addresses.toml: %d; усього підписок: %s", len(entries), db.stats())

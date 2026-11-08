@@ -31,6 +31,15 @@ CREATE TABLE IF NOT EXISTS address_state (
     updated_at INTEGER NOT NULL,
     PRIMARY KEY (street_id, house)
 );
+CREATE TABLE IF NOT EXISTS slack_bots (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_id   INTEGER NOT NULL,                   -- Telegram-користувач, який підключив бота
+    token      TEXT    NOT NULL,                   -- токен бота Slack (xoxb-…)
+    team       TEXT    NOT NULL DEFAULT '',        -- назва воркспейсу
+    bot_name   TEXT    NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL,
+    UNIQUE (owner_id, token)
+);
 CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 """
 
@@ -54,6 +63,19 @@ class Subscription:
 
 
 @dataclass(frozen=True)
+class SlackBot:
+    id: int
+    owner_id: int
+    token: str
+    team: str
+    bot_name: str
+
+    @property
+    def masked(self) -> str:
+        return f"xoxb-…{self.token[-4:]}"
+
+
+@dataclass(frozen=True)
 class GraphTarget:
     """Чат/канал, якому надсилати графік. `queues` — об'єднання черг його адрес; None — без фільтра."""
     channel: str
@@ -68,6 +90,11 @@ class AddressState:
     house: str
     last_text: str
     updated_at: int
+
+
+def _slack_bot(row: sqlite3.Row) -> SlackBot:
+    return SlackBot(id=row["id"], owner_id=row["owner_id"], token=row["token"],
+                    team=row["team"], bot_name=row["bot_name"])
 
 
 def _sub(row: sqlite3.Row) -> Subscription:
@@ -136,6 +163,48 @@ class Database:
             ).fetchall()
         return [_sub(r) for r in rows]
 
+    # --- Slack-боти користувачів ------------------------------------------
+    def add_slack_bot(self, owner_id: int, token: str, team: str, bot_name: str) -> tuple[SlackBot, bool]:
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT OR IGNORE INTO slack_bots (owner_id,token,team,bot_name,created_at) VALUES (?,?,?,?,?)",
+                (owner_id, token, team, bot_name, int(time.time())))
+            self._conn.commit()
+            row = self._conn.execute(
+                "SELECT * FROM slack_bots WHERE owner_id=? AND token=?", (owner_id, token)).fetchone()
+        return _slack_bot(row), cur.rowcount > 0
+
+    def get_slack_bot(self, bot_id: int) -> SlackBot | None:
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM slack_bots WHERE id=?", (bot_id,)).fetchone()
+        return _slack_bot(row) if row else None
+
+    def list_slack_bots(self, owner_id: int) -> list[SlackBot]:
+        with self._lock:
+            rows = self._conn.execute("SELECT * FROM slack_bots WHERE owner_id=? ORDER BY id", (owner_id,)).fetchall()
+        return [_slack_bot(r) for r in rows]
+
+    def stats_for_slack_bot(self, bot_id: int) -> int:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT COUNT(*) FROM subscriptions WHERE channel='slack' AND target LIKE ?",
+                (f"{bot_id}/%",)).fetchone()[0]
+
+    def delete_slack_bot(self, bot_id: int) -> int:
+        """Видаляє бота разом з усіма підписками на його канали. Повертає кількість підписок."""
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM subscriptions WHERE channel='slack' AND target LIKE ?", (f"{bot_id}/%",))
+            self._conn.execute("DELETE FROM slack_bots WHERE id=?", (bot_id,))
+            self._conn.commit()
+        return cur.rowcount
+
+    def all_subscriptions(self) -> list[Subscription]:
+        """Усі підписки, згруповані за чатом (для адміністратора)."""
+        with self._lock:
+            rows = self._conn.execute("SELECT * FROM subscriptions ORDER BY channel, target, id").fetchall()
+        return [_sub(r) for r in rows]
+
     def find_subscription(self, channel: str, target: str, street_id: str, house: str) -> Subscription | None:
         with self._lock:
             row = self._conn.execute(
@@ -145,11 +214,14 @@ class Database:
         return _sub(row) if row else None
 
     def list_by_owner(self, owner_id: int, channel: str, exclude_target: str) -> list[Subscription]:
-        """Підписки, створені користувачем в інших чатах/каналах (щоб керувати ними з приватного чату)."""
+        """Підписки, створені користувачем в інших чатах/каналах (щоб керувати ними з приватного чату).
+
+        Це всі канали доставки (Telegram і Slack), крім самого чату `channel`/`exclude_target`.
+        """
         with self._lock:
             rows = self._conn.execute(
-                "SELECT * FROM subscriptions WHERE owner_id=? AND channel=? AND target!=? AND source='bot' "
-                "ORDER BY target, id",
+                "SELECT * FROM subscriptions WHERE owner_id=? AND NOT (channel=? AND target=?) AND source='bot' "
+                "ORDER BY channel, target, id",
                 (owner_id, channel, str(exclude_target)),
             ).fetchall()
         return [_sub(r) for r in rows]

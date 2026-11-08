@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 import logging
 import re
 import time
@@ -23,7 +24,7 @@ from .db import Database, Subscription
 from .hoe import HoeClient, SearchUnavailable, match_house, suggest_houses
 from .monitor import MANUAL_REFRESH_MAX_AGE, TEXT_GRAPH_SUBJECT, Monitor, describe_state, label_for
 from .queues import QUEUES, filter_schedule, normalize_queue
-from .sinks import fit_body, render_message
+from .sinks import ChannelError, TargetGone, fit_body, render_message
 
 log = logging.getLogger(__name__)
 
@@ -31,11 +32,13 @@ HELP = (
     "<b>Сповіщення про погодинні відключення (Хмельницькобленерго)</b>\n\n"
     "/add — додати адресу: населений пункт → вулиця → будинок\n"
     "/add_id <code>&lt;streetId&gt; &lt;будинок&gt; [назва]</code> — додати адресу за ID вулиці\n"
+    "/slack — підключити власного Slack-бота / керувати ними\n"
     "/list — мої адреси та налаштування (сповіщення, графік, звук, черга)\n"
     "/check — перевірити всі мої адреси зараз\n"
     "/graph — показати актуальний графік (картинку та/або текст); якщо вказано чергу — лише для неї, "
     "<code>/graph all</code> — повністю\n"
     "/admin — панель адміністратора (лише для ADMIN_IDS)\n"
+    "/subs — усі підписки всіх чатів (лише для ADMIN_IDS)\n"
     "/cancel — скасувати поточну дію\n\n"
     "<b>Фільтр за чергою.</b> У /list натисни «🔢 Черга» біля адреси й обери свою підчергу (1.1 – 6.2): "
     "бот надсилатиме лише відключення твоєї черги (і текстовий графік лише з нею). "
@@ -45,11 +48,16 @@ HELP = (
     "<code>/add_id 123456 12 Дім --to=-1001234567890</code>\n"
     "<code>/add --to=@my_channel</code>\n"
     "Команди надсилай мені в приватні повідомлення; керувати такими адресами можна з /list.\n"
-    "У груповому чаті керувати адресами можуть лише адміністратори групи."
+    "У груповому чаті керувати адресами можуть лише адміністратори групи.\n\n"
+    "<b>Slack.</b> Підключи свого Slack-бота командою /slack (токен, інструкція всередині), запроси його в канал "
+    "(<code>/invite @назва_бота</code>) і дописуй <code>--slack=&lt;ID каналу або #назва&gt;</code>:\n"
+    "<code>/add_id 123456 12 Дім --slack=C0123ABCD</code>\n"
+    "<code>/add --slack=#svitlo</code>"
 )
 
 # На мобільних "--" часто автозамінюється на тире, тому приймаємо і його.
 TO_RE = re.compile(r"(?:^|\s)(?:--|—|–)to(?:=|\s+)(\S+)", re.IGNORECASE)
+SLACK_RE = re.compile(r"(?:^|\s)(?:--|—|–)slack(?:=|\s+)(\S+)", re.IGNORECASE)
 QUEUE_RE = re.compile(r"(?:^|\s)(?:--|—|–)queue(?:=|\s+)(\S+)", re.IGNORECASE)
 USERNAME_RE = re.compile(r"@[A-Za-z][A-Za-z0-9_]{3,31}")
 QUEUES_HINT = f"{QUEUES[0]} … {QUEUES[-1]}"
@@ -63,6 +71,35 @@ class AddFlow(StatesGroup):
     house = State()
 
 
+@dataclass(frozen=True)
+class Dest:
+    """Куди надсилати сповіщення, якщо не в поточний чат."""
+    channel: str          # "tg" | "slack"
+    target: str
+    title: str
+
+    def as_list(self) -> list[str]:        # для збереження в FSM
+        return [self.channel, self.target, self.title]
+
+
+class SlackFlow(StatesGroup):
+    token = State()
+
+
+MAX_SLACK_BOTS = 3
+SLACK_TOKEN_RE = re.compile(r"xoxb-[A-Za-z0-9-]{10,}")
+SLACK_GUIDE = (
+    "<b>Як підключити Slack</b>\n"
+    "1. Відкрий api.slack.com/apps → <b>Create New App</b> → From scratch, обери воркспейс.\n"
+    "2. <b>OAuth &amp; Permissions</b> → Bot Token Scopes: <code>chat:write</code>, <code>files:write</code>; "
+    "щоб шукати канали за #назвою — ще <code>channels:read</code>, <code>groups:read</code>.\n"
+    "3. <b>Install to Workspace</b> і скопіюй <b>Bot User OAuth Token</b> (починається з <code>xoxb-</code>).\n"
+    "4. Надішли токен сюди одним повідомленням — я одразу видалю його з чату й збережу.\n\n"
+    "Потім запроси бота в канал (<code>/invite @назва_бота</code>) і додавай адреси з <code>--slack=…</code>.\n"
+    "Скасувати — /cancel."
+)
+
+
 class TargetError(Exception):
     """Користувачу показується текст помилки як є."""
 
@@ -71,6 +108,15 @@ def split_to(args: str | None) -> tuple[str, str | None]:
     """Відокремлює `--to=...` від решти аргументів команди."""
     args = args or ""
     m = TO_RE.search(args)
+    if not m:
+        return args.strip(), None
+    return (args[: m.start()] + args[m.end():]).strip(), m.group(1)
+
+
+def split_slack(args: str | None) -> tuple[str, str | None]:
+    """Відокремлює `--slack=...` від решти аргументів команди."""
+    args = args or ""
+    m = SLACK_RE.search(args)
     if not m:
         return args.strip(), None
     return (args[: m.start()] + args[m.end():]).strip(), m.group(1)
@@ -195,15 +241,17 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
         return chat.id, chat.title or chat.username or str(chat.id)
 
     async def finish_add(message: Message, user_id: int, street_id: str, house: str, label: str,
-                         target: int | None = None, target_title: str | None = None,
-                         queue: str | None = None) -> None:
-        external = target is not None and target != message.chat.id
-        chat_id = str(target if external else message.chat.id)
-        if db.count_for_target("tg", chat_id) >= settings.max_addresses_per_chat:
-            where = f"«{escape(target_title or chat_id)}»" if external else "чат"
+                         dest: Dest | None = None, queue: str | None = None) -> None:
+        slack = dest is not None and dest.channel == "slack"
+        external = slack or (dest is not None and dest.target != str(message.chat.id))
+        channel = "slack" if slack else "tg"
+        chat_id = dest.target if dest else str(message.chat.id)
+        title = dest.title if dest else chat_id
+        if db.count_for_target(channel, chat_id) >= settings.max_addresses_per_chat:
+            where = f"«{escape(title)}»" if external else "чат"
             await message.answer(f"Ліміт: {settings.max_addresses_per_chat} адрес на {where}. Видали зайві в /list.")
             return
-        if db.find_subscription("tg", chat_id, street_id, house):
+        if db.find_subscription(channel, chat_id, street_id, house):
             await message.answer("Ця адреса вже є в списку" + (" цього каналу." if external else "."))
             return
 
@@ -212,13 +260,26 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
         state = db.get_state(street_id, house)
         status = describe_state(state, queue) if state else (
             "Не вдалося отримати дані з сайту зараз — повідомлю, щойно вони з'являться.")
+        heading = f"{label}{' · черга ' + queue if queue else ''}"
 
-        if external:
+        if slack:
+            # Перше повідомлення водночас перевіряє, що бот справді може писати в канал.
+            try:
+                await monitor.sinks["slack"].send_text(chat_id, "", heading, status, silent=True)
+            except TargetGone:
+                await message.answer("Бот не може писати в цей канал: запроси його командою "
+                                     "<code>/invite @назва_бота</code> і спробуй ще раз. Адресу не додано.")
+                return
+            except Exception as exc:
+                log.warning("Не вдалося написати в Slack %s: %s", chat_id, exc)
+                await message.answer("Не вдалося надіслати повідомлення в Slack (перевір права бота). "
+                                     "Адресу не додано.")
+                return
+        elif external:
             # Перше повідомлення в канал водночас перевіряє, що публікація справді працює.
             try:
                 await message.bot.send_message(
-                    int(chat_id), f"📍 <b>{escape(label)}{' · черга ' + queue if queue else ''}</b>"
-                    f"\n\n<pre>{escape(status)}</pre>",
+                    int(chat_id), f"📍 <b>{escape(heading)}</b>\n\n<pre>{escape(status)}</pre>",
                     disable_notification=settings.default_silent)
             except TelegramAPIError as exc:
                 log.warning("Не вдалося написати в %s: %s", chat_id, exc)
@@ -227,13 +288,15 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
                 return
 
         sub, _ = db.add_subscription(
-            "tg", chat_id, street_id, house, label,
+            channel, chat_id, street_id, house, label,
             graphs=settings.default_graphs, silent=settings.default_silent, owner_id=user_id, queue=queue,
         )
         hint = ("Налаштування — кнопками нижче або в /list." if queue else
                 "Щоб отримувати лише відключення своєї черги, натисни «🔢 Черга».")
         if external:
-            await message.answer(f"✅ Додано в «{escape(target_title or chat_id)}»: <b>{escape(label)}</b>\n{hint}",
+            kind = "Slack" if slack else "«" + escape(title) + "»"
+            where = f"у Slack ({escape(title)})" if slack else f"в {kind}"
+            await message.answer(f"✅ Додано {where}: <b>{escape(label)}</b>\n{hint}",
                                  reply_markup=sub_keyboard(sub))
         else:
             await message.answer(
@@ -250,16 +313,48 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
             return None, False
         return queue, True
 
-    async def maybe_resolve(message: Message, raw_to: str | None) -> tuple[int | None, str | None, bool]:
-        """(target, title, ok). ok=False — помилку вже показано користувачу."""
-        if raw_to is None:
-            return None, None, True
+    async def resolve_slack(raw: str, user_id: int) -> Dest:
+        """Перевіряє `--slack=[№бота:]канал`: у користувача є свій Slack-бот і канал для нього існує."""
+        sink = monitor.sinks.get("slack")
+        bots = db.list_slack_bots(user_id)
+        if sink is None or not bots:
+            raise TargetError("Спершу підключи свого Slack-бота: /slack")
+        m = re.fullmatch(r"(\d+):(.+)", raw)
+        if m:
+            bot = next((b for b in bots if b.id == int(m.group(1))), None)
+            if bot is None:
+                raise TargetError("Немає твого Slack-бота з таким номером. Список — у /slack.")
+            ref = m.group(2)
+        elif len(bots) == 1:
+            bot, ref = bots[0], raw
+        else:
+            lst = "\n".join(f"№{b.id} — {escape(b.team)} ({escape(b.bot_name)})" for b in bots)
+            raise TargetError(f"У тебе кілька Slack-ботів, вкажи номер: <code>--slack=&lt;№&gt;:&lt;канал&gt;</code>\n{lst}")
         try:
+            channel_id, title = await sink.resolve(bot.id, ref)
+        except ChannelError as exc:
+            raise TargetError(escape(str(exc))) from None
+        except Exception:
+            log.exception("Slack: не вдалося перевірити канал %r", ref)
+            raise TargetError("Не вдалося звернутися до Slack. Спробуй пізніше.") from None
+        return Dest("slack", f"{bot.id}/{channel_id}", f"{bot.team} {title}")
+
+    async def maybe_resolve(message: Message, raw_to: str | None,
+                            raw_slack: str | None = None) -> tuple[Dest | None, bool]:
+        """(призначення, ok). ok=False — помилку вже показано користувачу."""
+        if raw_to is not None and raw_slack is not None:
+            await message.answer("Вкажи або <code>--to</code> (Telegram), або <code>--slack</code>, не обидва.")
+            return None, False
+        if raw_to is None and raw_slack is None:
+            return None, True
+        try:
+            if raw_slack is not None:
+                return await resolve_slack(raw_slack, message.from_user.id), True
             target, title = await resolve_target(message.bot, raw_to, message.from_user.id)
         except TargetError as exc:
             await message.answer(str(exc))
-            return None, None, False
-        return target, title, True
+            return None, False
+        return Dest("tg", str(target), title), True
 
     # --- бота вилучили з чату / користувач його заблокував ----------------
     @router.my_chat_member()
@@ -305,17 +400,19 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
         if not await guard(message):
             return
         rest, raw_to = split_to(command.args)
+        rest, raw_slack = split_slack(rest)
         _, raw_queue = split_queue(rest)
         queue, ok = await parse_queue_option(message, raw_queue)
         if not ok:
             return
-        target, title, ok = await maybe_resolve(message, raw_to)
+        dest, ok = await maybe_resolve(message, raw_to, raw_slack)
         if not ok:
             return
         await state.clear()
         await state.set_state(AddFlow.settlement_query)
-        await state.update_data(target=target, target_title=title, queue=queue)
-        where = f" (у «{escape(title)}»)" if title else ""
+        await state.update_data(dest=dest.as_list() if dest else None, queue=queue)
+        where = (f" (у Slack: {escape(dest.title)})" if dest.channel == "slack" else
+                 f" (у «{escape(dest.title)}»)") if dest else ""
         markup = prompt_markup(message.chat.type)
         last = last_settlement(message.from_user.id)
         if markup is None and last:  # у приватному чаті пропонуємо швидкий вибір останнього міста
@@ -420,8 +517,9 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
         data = await state.get_data()
         await state.clear()
         label = f"{data['settlement_name']}, {data['street_name']}, {house_no}"[:80]
+        raw_dest = data.get("dest")
         await finish_add(message, user_id, data["street_id"], house_no, label,
-                         data.get("target"), data.get("target_title"), data.get("queue"))
+                         Dest(*raw_dest) if raw_dest else None, data.get("queue"))
 
     @router.message(StateFilter(AddFlow.house), F.text, ~F.text.startswith("/"))
     async def house(message: Message, state: FSMContext) -> None:
@@ -466,22 +564,133 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
         if not await guard(message):
             return
         rest, raw_to = split_to(command.args)
+        rest, raw_slack = split_slack(rest)
         rest, raw_queue = split_queue(rest)
         parts = rest.split(maxsplit=2)
         if len(parts) < 2:
             await message.answer("Формат: <code>/add_id &lt;streetId&gt; &lt;будинок&gt; [назва] "
-                                 "[--queue=1.1] [--to=&lt;ID каналу або @username&gt;]</code>")
+                                 "[--queue=1.1] [--to=&lt;ID каналу або @username&gt; | "
+                                 "--slack=&lt;ID каналу або #назва&gt;]</code>")
             return
         queue, ok = await parse_queue_option(message, raw_queue)
         if not ok:
             return
-        target, title, ok = await maybe_resolve(message, raw_to)
+        dest, ok = await maybe_resolve(message, raw_to, raw_slack)
         if not ok:
             return
         street_id, house_no = parts[0], parts[1]
         label = parts[2].strip() if len(parts) > 2 else f"вул. #{street_id}, {house_no}"
         await state.clear()
-        await finish_add(message, message.from_user.id, street_id, house_no, label[:80], target, title, queue)
+        await finish_add(message, message.from_user.id, street_id, house_no, label[:80], dest, queue)
+
+    # --- Slack-боти користувачів ---------------------------------------------
+    async def show_slack_menu(message: Message, user_id: int) -> None:
+        bots = db.list_slack_bots(user_id)
+        lines = ["<b>Твої Slack-боти</b>"] if bots else ["Slack-ботів ще немає."]
+        rows = []
+        for b in bots:
+            n = db.stats_for_slack_bot(b.id)
+            lines.append(f"№{b.id} — {escape(b.team)}, бот {escape(b.bot_name)} (<code>{b.masked}</code>), "
+                         f"підписок: {n}")
+            rows.append([InlineKeyboardButton(text=f"🗑 №{b.id} {b.team}"[:60], callback_data=f"slk:del:{b.id}")])
+        rows.append([InlineKeyboardButton(text="➕ Підключити Slack-бота", callback_data="slk:add")])
+        lines.append("\nКанал вказуй у командах як <code>--slack=C0123ABCD</code> або <code>--slack=#назва</code>"
+                     + (" (з кількома ботами — <code>--slack=№:канал</code>)." if len(bots) > 1 else "."))
+        await message.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+    async def connect_slack(message: Message, user_id: int, token: str) -> bool:
+        """Перевіряє й зберігає токен. True — розмову завершено (успіх чи остаточна помилка)."""
+        try:                                   # токен — секрет: прибираємо його з історії чату
+            await message.delete()
+        except TelegramAPIError:
+            pass
+        if len(db.list_slack_bots(user_id)) >= MAX_SLACK_BOTS:
+            await message.answer(f"Максимум {MAX_SLACK_BOTS} Slack-ботів. Видали зайвого в /slack.")
+            return True
+        sink = monitor.sinks.get("slack")
+        if sink is None:
+            await message.answer("Slack на цьому сервері недоступний.")
+            return True
+        try:
+            team, bot_name = await sink.inspect(token)
+        except ChannelError as exc:
+            await message.answer(f"{escape(str(exc))}\nНадішли токен ще раз або /cancel.")
+            return False
+        except Exception:
+            log.exception("Slack: не вдалося перевірити токен")
+            await message.answer("Не вдалося звернутися до Slack. Спробуй пізніше.")
+            return True
+        bot, created = db.add_slack_bot(user_id, token, team, bot_name)
+        await message.answer(
+            f"✅ {'Підключено' if created else 'Цей бот уже підключено'}: <b>{escape(team)}</b>, "
+            f"бот {escape(bot_name)} (№{bot.id}).\n\nЗапроси його в канал: <code>/invite @{escape(bot_name)}</code>, "
+            "а потім додай адресу:\n<code>/add_id 123456 12 Дім --slack=C0123ABCD</code>")
+        return True
+
+    @router.message(Command("slack"))
+    async def slack_command(message: Message, command: CommandObject, state: FSMContext) -> None:
+        user_id = message.from_user.id if message.from_user else 0
+        if not allowed(message.chat.id, user_id):
+            return
+        if message.chat.type != ChatType.PRIVATE:
+            await message.answer("Токен — це секрет, тож /slack працює лише в приватному чаті зі мною.")
+            return
+        arg = (command.args or "").strip()
+        if arg:
+            m = SLACK_TOKEN_RE.fullmatch(arg)
+            if not m:
+                await message.answer("Це не схоже на токен бота Slack (xoxb-…). Інструкція: /slack")
+                return
+            await connect_slack(message, user_id, arg)
+            return
+        await state.clear()
+        await show_slack_menu(message, user_id)
+
+    @router.callback_query(F.data.regexp(r"^slk:(add|del:\d+|delyes:\d+|no)$"))
+    async def slack_action(cb: CallbackQuery, state: FSMContext) -> None:
+        user_id = cb.from_user.id
+        if cb.message.chat.type != ChatType.PRIVATE or not allowed(cb.message.chat.id, user_id):
+            await cb.answer("Лише в приватному чаті.", show_alert=True)
+            return
+        parts = cb.data.split(":")
+        if parts[1] == "add":
+            await state.clear()
+            await state.set_state(SlackFlow.token)
+            await cb.message.answer(SLACK_GUIDE)
+        elif parts[1] == "no":
+            await cb.message.edit_text("Скасовано.")
+        else:
+            bot = db.get_slack_bot(int(parts[2]))
+            if bot is None or bot.owner_id != user_id:
+                await cb.answer("Бота не знайдено.", show_alert=True)
+                return
+            if parts[1] == "del":
+                kb = InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="✅ Так, видалити", callback_data=f"slk:delyes:{bot.id}"),
+                    InlineKeyboardButton(text="✖ Ні", callback_data="slk:no")]])
+                await cb.message.answer(
+                    f"Видалити бота №{bot.id} ({escape(bot.team)}) і всі підписки на його канали "
+                    f"({db.stats_for_slack_bot(bot.id)})?", reply_markup=kb)
+            else:
+                removed = db.delete_slack_bot(bot.id)
+                await cb.message.edit_text(f"🗑 Видалено бота №{bot.id}. Підписок прибрано: {removed}.")
+        await cb.answer()
+
+    @router.message(StateFilter(SlackFlow.token), F.text, ~F.text.startswith("/"))
+    async def slack_token_received(message: Message, state: FSMContext) -> None:
+        user_id = message.from_user.id if message.from_user else 0
+        if message.chat.type != ChatType.PRIVATE:
+            return
+        token = message.text.strip()
+        if not SLACK_TOKEN_RE.fullmatch(token):
+            try:
+                await message.delete()
+            except TelegramAPIError:
+                pass
+            await message.answer("Це не схоже на токен бота (має починатися з xoxb-). Спробуй ще раз або /cancel.")
+            return
+        if await connect_slack(message, user_id, token):
+            await state.clear()
 
     # --- список і керування -----------------------------------------------
     async def chat_title(bot: Bot, chat_id: str) -> str:
@@ -491,6 +700,17 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
         except (TelegramAPIError, ValueError):
             return chat_id
 
+    async def dest_title(bot: Bot, sub: Subscription) -> str:
+        if sub.channel != "slack":
+            return await chat_title(bot, sub.target)
+        bot_id, _, channel_id = sub.target.partition("/")
+        slack_bot = db.get_slack_bot(int(bot_id)) if bot_id.isdigit() else None
+        team = slack_bot.team if slack_bot else "Slack"
+        try:
+            return f"Slack: {team} {(await monitor.sinks['slack'].resolve(slack_bot.id, channel_id))[1]}"
+        except Exception:
+            return f"Slack: {team} {channel_id}"
+
     @router.message(Command("list"))
     async def list_(message: Message) -> None:
         user_id = message.from_user.id if message.from_user else 0
@@ -499,7 +719,7 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
         subs = [(s, None) for s in db.list_subscriptions("tg", str(message.chat.id))]
         if message.chat.type == ChatType.PRIVATE:
             for s in db.list_by_owner(user_id, "tg", str(message.chat.id)):
-                subs.append((s, await chat_title(message.bot, s.target)))
+                subs.append((s, await dest_title(message.bot, s)))
         if not subs:
             await message.answer("Адрес ще немає. Додай через /add.")
             return
@@ -510,10 +730,14 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
         """Чи може той, хто натиснув кнопку, змінювати цю підписку. Якщо ні — показує причину."""
         chat = cb.message.chat
         user_id = cb.from_user.id
-        if sub is None or sub.channel != "tg":
+        if sub is None or sub.channel not in {"tg", "slack"}:
             await cb.answer("Запис не знайдено.", show_alert=True)
             return False
-        if sub.target == str(chat.id):
+        if sub.channel == "slack":
+            # Slack-підписками керують із приватного чату: той, хто підключив бота, та адміністратори.
+            permitted = chat.type == ChatType.PRIVATE and (
+                sub.owner_id == user_id or user_id in settings.admin_ids)
+        elif sub.target == str(chat.id):
             permitted = await can_manage(cb.bot, chat.id, chat.type, user_id)
         else:
             # Підписка в каналі/групі, якою керують із приватного чату: лише її автор,
@@ -629,6 +853,7 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
             return InlineKeyboardButton(text=text, callback_data=data)
         return InlineKeyboardMarkup(inline_keyboard=[
             [btn("📊 Статистика", "adm:stats"), btn("🔄 Опитати зараз", "adm:poll")],
+            [btn("👥 Усі підписки", "adm:subs:0")],
             [btn("📋 Показати текстовий графік", "adm:show_text")],
             [btn("🖼 Показати картинку-графік", "adm:show_img")],
             [btn("📤 Розіслати текстовий графік", "adm:send_text")],
@@ -646,13 +871,58 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
             return
         await message.answer(ADMIN_HELP, reply_markup=admin_keyboard())
 
+    SUBS_PER_PAGE = 10
+
+    async def subs_page(bot: Bot, page: int) -> tuple[str, InlineKeyboardMarkup | None]:
+        subs = db.all_subscriptions()
+        if not subs:
+            return "Підписок поки немає.", None
+        pages = (len(subs) + SUBS_PER_PAGE - 1) // SUBS_PER_PAGE
+        page = max(0, min(page, pages - 1))
+        chunk = subs[page * SUBS_PER_PAGE:(page + 1) * SUBS_PER_PAGE]
+        titles: dict[str, str] = {}
+        for sub in chunk:
+            if sub.channel == "tg" and sub.target not in titles:
+                titles[sub.target] = ""
+                try:
+                    chat = await bot.get_chat(int(sub.target))
+                    titles[sub.target] = chat.title or chat.full_name or chat.username or ""
+                except Exception:   # чат недоступний — покажемо лише ID
+                    pass
+        lines, last = [f"<b>Підписки</b> ({len(subs)}), сторінка {page + 1}/{pages}"], None
+        for sub in chunk:
+            key = (sub.channel, sub.target)
+            if key != last:
+                title = titles.get(sub.target, "")
+                lines.append(f"\n<b>{sub.channel}:{escape(sub.target)}</b>" + (f" — {escape(title)}" if title else ""))
+                last = key
+            flags = ("" if sub.events else " 🔕відкл.") + (" 🖼графік" if sub.graphs else "") + \
+                    ("" if sub.silent else " 🔔зі звуком") + (" 🔒" if sub.source == "config" else "")
+            queue = f" · черга {sub.queue}" if sub.queue else ""
+            lines.append(f"• {escape(sub.label)}{queue} <code>({sub.street_id}, {escape(sub.house)})</code>{flags}")
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(text="◀", callback_data=f"adm:subs:{page - 1}"))
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton(text="▶", callback_data=f"adm:subs:{page + 1}"))
+        return "\n".join(lines), (InlineKeyboardMarkup(inline_keyboard=[nav]) if nav else None)
+
+    @router.message(Command("subs"))
+    async def subs_command(message: Message, command: CommandObject, bot: Bot) -> None:
+        if (not message.from_user or message.from_user.id not in settings.admin_ids
+                or message.chat.type != ChatType.PRIVATE):
+            return
+        arg = (command.args or "").strip()
+        text, kb = await subs_page(bot, int(arg) - 1 if arg.isdigit() else 0)
+        await message.answer(text, reply_markup=kb)
+
     @router.message(Command("stats"))
     async def stats(message: Message) -> None:
         if not message.from_user or message.from_user.id not in settings.admin_ids:
             return
         await message.answer(stats_text())
 
-    @router.callback_query(F.data.regexp(r"^adm:(stats|poll|show_text|show_img|send_text|send_img)(:(yes|no))?$"))
+    @router.callback_query(F.data.regexp(r"^adm:(stats|poll|show_text|show_img|send_text|send_img|subs)(:(yes|no|\d+))?$"))
     async def admin_action(cb: CallbackQuery) -> None:
         if cb.from_user.id not in settings.admin_ids or cb.message.chat.type != ChatType.PRIVATE:
             await cb.answer("Лише для адміністраторів.", show_alert=True)
@@ -660,7 +930,17 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
         parts = cb.data.split(":")
         action, confirm = parts[1], (parts[2] if len(parts) > 2 else None)
 
-        if action == "stats":
+        if action == "subs":
+            text, kb = await subs_page(cb.bot, int(confirm or 0))
+            try:
+                if confirm is None:
+                    await cb.message.answer(text, reply_markup=kb)
+                else:
+                    await cb.message.edit_text(text, reply_markup=kb)
+            except TelegramAPIError:   # напр. «message is not modified»
+                pass
+            await cb.answer()
+        elif action == "stats":
             await cb.answer()
             await cb.message.answer(stats_text())
         elif action == "poll":
