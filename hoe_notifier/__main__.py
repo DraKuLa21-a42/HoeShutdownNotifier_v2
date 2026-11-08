@@ -1,4 +1,5 @@
-"""Запуск: `python -m hoe_notifier` (сервіс) або `python -m hoe_notifier import-legacy home`."""
+"""Запуск: `python -m hoe_notifier` (сервіс), `python -m hoe_notifier import-legacy home`
+або `python -m hoe_notifier reset-settings-password` (скинути пароль меню /settings)."""
 from __future__ import annotations
 
 import asyncio
@@ -12,6 +13,7 @@ from .config import ConfigError, load_settings
 from .db import Database
 from .hoe import HoeClient
 from .monitor import Monitor
+from .runtime import KV_PASSWORD, RuntimeSettings
 from .sinks import SlackSink, TelegramSink
 
 log = logging.getLogger("hoe_notifier")
@@ -62,6 +64,8 @@ async def run() -> int:
     if box is None and db.plaintext_slack_tokens():
         log.warning("Токени Slack-ботів зберігаються в базі відкритим текстом: задайте SECRET_KEY у .env, "
                     "і при наступному запуску їх буде зашифровано")
+    # значення, змінені адміністратором у /settings, перекривають .env
+    settings = RuntimeSettings(settings, db, box)
     hoe = HoeClient(
         settings.hoe_base_url, timeout=settings.request_timeout, retries=settings.retries,
         retry_delay=settings.retry_delay,
@@ -98,18 +102,45 @@ async def run() -> int:
     log.info("Адрес з addresses.toml: %d; усього підписок: %s", len(entries), db.stats())
 
     cabinet = None
-    if settings.cabinet_enabled:
+    if box is not None:   # сервіс є завжди, коли є ключ; вмикається/вимикається налаштуванням CABINET_ENABLED
         from .cabinet import CabinetClient, CabinetService
 
         cabinet = CabinetService(
             db, CabinetClient(settings.cabinet_base_url, timeout=settings.request_timeout,
                               retries=settings.retries, retry_delay=settings.retry_delay),
             box)
-        log.info("Особистий кабінет: увімкнено, оновлення черг кожні %d с", settings.cabinet_sync_interval)
+        if settings.cabinet:
+            log.info("Особистий кабінет: увімкнено, оновлення черг кожні %d с", settings.cabinet_sync_interval)
 
     monitor = Monitor(db, hoe, sinks, poll_interval=settings.poll_interval,
                       concurrency=settings.concurrency, admin_notify=admin_notify,
                       cabinet=cabinet, cabinet_interval=settings.cabinet_sync_interval)
+
+    http_clients = [hoe] + ([cabinet.client] if cabinet else [])
+
+    def apply_setting(name: str, value) -> None:
+        """Застосовує налаштування з /settings без перезапуску."""
+        if name == "poll_interval":
+            monitor.poll_interval = value
+        elif name == "concurrency":
+            monitor.concurrency = value
+        elif name == "cabinet":
+            monitor.cabinet_enabled = bool(value)
+        elif name == "cabinet_sync_interval":
+            monitor.cabinet_interval = value
+        elif name == "request_timeout":
+            for client in http_clients:
+                client._client.timeout = value
+        elif name in {"retries", "retry_delay"}:
+            for client in http_clients:
+                setattr(client, name, value)
+        elif name == "slack_token":
+            sinks["slack"].token = value
+        elif name == "log_level":
+            logging.getLogger().setLevel(value)
+
+    settings.on_change(apply_setting)
+    settings.apply_all()
     monitor_task = asyncio.create_task(monitor.run_forever(), name="monitor")
 
     try:
@@ -142,9 +173,29 @@ async def run() -> int:
     return 0
 
 
+def reset_settings_password() -> int:
+    """Видаляє пароль меню /settings (якщо його забули); наступний вхід запропонує створити новий."""
+    try:
+        settings = load_settings()
+    except ConfigError as exc:
+        print(f"Помилка конфігурації: {exc}", file=sys.stderr)
+        return 2
+    db = Database(settings.db_path)
+    had = db.kv_get(KV_PASSWORD) is not None
+    db.kv_delete(KV_PASSWORD)
+    db.close()
+    print("Пароль меню налаштувань скинуто. Відкрий /settings у боті, щоб створити новий."
+          if had else "Пароль меню налаштувань і так не задано.")
+    if had:
+        print("Якщо бот запущено — перезапусти його, щоб закрити відкриті сесії.")
+    return 0
+
+
 def main() -> None:
     if len(sys.argv) >= 3 and sys.argv[1] == "import-legacy":
         sys.exit(import_legacy(sys.argv[2]))
+    if len(sys.argv) >= 2 and sys.argv[1] == "reset-settings-password":
+        sys.exit(reset_settings_password())
     sys.exit(asyncio.run(run()))
 
 

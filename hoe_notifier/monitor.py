@@ -101,6 +101,7 @@ class Monitor:
         self._fail_streak = 0
         self._abort_cycle = False
         self.cabinet = cabinet
+        self.cabinet_enabled = True                   # вимикається з меню /settings без перезапуску
         self.cabinet_interval = cabinet_interval
         self.cabinet_synced_at: float | None = None   # time.monotonic() останнього оновлення черг
         self._cabinet_lock = asyncio.Lock()
@@ -249,7 +250,7 @@ class Monitor:
         поки користувач не оновить його в /cabinet). З `account_id` — лише цей акаунт (кнопка «Оновити зараз»).
         """
         report = CabinetSyncReport()
-        if self.cabinet is None:
+        if self.cabinet is None or not self.cabinet_enabled:
             return report
         async with self._cabinet_lock:
             if account_id is None:
@@ -323,7 +324,7 @@ class Monitor:
             log.warning("Не вдалось написати власнику кабінету %s", owner_id, exc_info=True)
 
     async def maybe_sync_cabinet(self) -> None:
-        if self.cabinet is None:
+        if self.cabinet is None or not self.cabinet_enabled:
             return
         if self.cabinet_synced_at is not None and time.monotonic() - self.cabinet_synced_at < self.cabinet_interval:
             return

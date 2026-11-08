@@ -25,6 +25,10 @@ from .db import CabinetAccount, Database, Subscription
 from .hoe import HoeClient, SearchUnavailable, match_house, suggest_houses
 from .monitor import MANUAL_REFRESH_MAX_AGE, TEXT_GRAPH_SUBJECT, Monitor, describe_state, label_for
 from .queues import QUEUES, filter_schedule, normalize_queue
+from .runtime import (
+    GROUPS, MIN_PASSWORD_LEN, SPECS, RuntimeSettings, SettingError, format_number, format_value, hash_password,
+    parse_value, verify_password,
+)
 from .sinks import ChannelError, TargetGone, fit_body, render_message
 
 log = logging.getLogger(__name__)
@@ -39,6 +43,7 @@ HELP = (
     "/graph — показати актуальний графік (картинку та/або текст); якщо вказано чергу — лише для неї, "
     "<code>/graph all</code> — повністю\n"
     "/admin — панель адміністратора (лише для ADMIN_IDS)\n"
+    "/settings — налаштування сервісу під окремим паролем (лише для ADMIN_IDS)\n"
     "/subs — усі підписки всіх чатів (лише для ADMIN_IDS)\n"
     "/cancel — скасувати поточну дію\n\n"
     "<b>Фільтр за чергою.</b> У /list натисни «🔢 Черга» біля адреси й обери свою підчергу (1.1 – 6.2): "
@@ -87,6 +92,18 @@ class Dest:
 
 class SlackFlow(StatesGroup):
     token = State()
+
+
+class SettingsFlow(StatesGroup):
+    password = State()          # вхід у меню налаштувань
+    new_password = State()      # створення / зміна пароля
+    confirm_password = State()
+    value = State()             # нове значення налаштування (у даних FSM: setting=<назва>)
+
+
+SETTINGS_SESSION_TTL = 15 * 60  # сесія меню налаштувань без дій, с
+SETTINGS_MAX_FAILURES = 5       # невдалих спроб пароля поспіль до блокування
+SETTINGS_LOCKOUT = 15 * 60      # тривалість блокування, с
 
 
 class CabinetFlow(StatesGroup):
@@ -200,7 +217,13 @@ def prompt_markup(chat_type: str) -> ForceReply | None:
 
 def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Monitor) -> Router:
     router = Router()
-    cabinet = monitor.cabinet          # None — інтеграцію з кабінетом вимкнено
+    if not isinstance(settings, RuntimeSettings):   # тести й прості запуски передають звичайні Settings
+        settings = RuntimeSettings(settings, db, env_present=set())
+    cabinet = monitor.cabinet          # None — немає SECRET_KEY
+
+    def cabinet_on() -> bool:
+        """Інтеграція доступна: є ключ (сервіс створено) і її не вимкнено в /settings."""
+        return cabinet is not None and monitor.cabinet_enabled and settings.cabinet
 
     def allowed(chat_id: int, user_id: int) -> bool:
         if not settings.allowed_chat_ids or user_id in settings.admin_ids:
@@ -329,7 +352,7 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
         else:
             hint = ("Налаштування — кнопками нижче або в /list." if queue else
                     "Щоб отримувати лише відключення своєї черги, натисни «🔢 Черга».")
-        markup = queue_keyboard(sub, cabinet is not None) if ask_queue else sub_keyboard(sub)
+        markup = queue_keyboard(sub, cabinet_on()) if ask_queue else sub_keyboard(sub)
         if external:
             kind = "Slack" if slack else "«" + escape(title) + "»"
             where = f"у Slack ({escape(title)})" if slack else f"в {kind}"
@@ -558,7 +581,7 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
         data = await state.get_data()
         label = f"{data['settlement_name']}, {data['street_name']}, {house_no}"[:80]
         await state.update_data(house_no=house_no, label=label)
-        if cabinet is not None and message.chat.type == ChatType.PRIVATE and data.get("queue") is None:
+        if cabinet_on() and message.chat.type == ChatType.PRIVATE and data.get("queue") is None:
             # Логін і пароль приймаємо лише в приватному чаті; у групі — як раніше, без цього кроку.
             await state.update_data(cab={"kind": "add"})
             await state.set_state(CabinetFlow.choose)
@@ -784,7 +807,7 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
 
     async def start_cabinet_link(cb: CallbackQuery, state: FSMContext, sub: Subscription) -> None:
         """Кнопка «🔐 Взяти з особистого кабінету» в меню черги вже доданої адреси."""
-        if cabinet is None:
+        if not cabinet_on():
             await cb.answer("Інтеграцію з кабінетом на цьому сервері не ввімкнено.", show_alert=True)
             return
         if cb.message.chat.type != ChatType.PRIVATE:
@@ -994,7 +1017,7 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
         sub = db.get_subscription(cab.get("sub_id") or 0)
         if sub:
             await cb.message.answer(f"Обери чергу для <b>{escape(sub.label)}</b>:",
-                                    reply_markup=queue_keyboard(sub, cabinet is not None))
+                                    reply_markup=queue_keyboard(sub, cabinet_on()))
 
     async def apply_cabinet_queue(message: Message, state: FSMContext, user_id: int) -> None:
         data = await state.get_data()
@@ -1053,7 +1076,7 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
         user_id = message.from_user.id if message.from_user else 0
         if not allowed(message.chat.id, user_id):
             return
-        if cabinet is None:
+        if not cabinet_on():
             await message.answer("Інтеграцію з особистим кабінетом на цьому сервері не ввімкнено.")
             return
         if message.chat.type != ChatType.PRIVATE:
@@ -1065,7 +1088,7 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
     @router.callback_query(F.data.regexp(r"^cab:((sync|pass|del|delyes):\d+|no)$"))
     async def cabinet_action(cb: CallbackQuery, state: FSMContext) -> None:
         user_id = cb.from_user.id
-        if cabinet is None or cb.message.chat.type != ChatType.PRIVATE or not allowed(cb.message.chat.id, user_id):
+        if not cabinet_on() or cb.message.chat.type != ChatType.PRIVATE or not allowed(cb.message.chat.id, user_id):
             await cb.answer("Лише в приватному чаті.", show_alert=True)
             return
         parts = cb.data.split(":")
@@ -1171,7 +1194,7 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
             db.delete_subscription(sub.id)
             await cb.message.edit_text(f"🗑 Видалено: <b>{escape(sub.label)}</b>")
         elif action == "queue":
-            await cb.message.edit_reply_markup(reply_markup=queue_keyboard(sub, cabinet is not None))
+            await cb.message.edit_reply_markup(reply_markup=queue_keyboard(sub, cabinet_on()))
         else:
             sub = db.toggle(sub.id, action)
             await cb.message.edit_reply_markup(reply_markup=sub_keyboard(sub))
@@ -1252,6 +1275,303 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
         queues = None if everything else db.chat_queues("tg", str(message.chat.id))
         await send_site_graph(message, queues=queues)
 
+    # --- меню налаштувань (окремий пароль) -----------------------------------
+    unlocked: dict[int, float] = {}               # user_id → time.monotonic(), до якого діє сесія
+    failures: dict[int, list[float]] = {}         # user_id → [кількість невдалих спроб, заблоковано до]
+
+    def is_admin_private(chat_type: str, user_id: int) -> bool:
+        return chat_type == ChatType.PRIVATE and user_id in settings.admin_ids
+
+    def session_active(user_id: int) -> bool:
+        until = unlocked.get(user_id)
+        if until is None or time.monotonic() > until:
+            unlocked.pop(user_id, None)
+            return False
+        unlocked[user_id] = time.monotonic() + SETTINGS_SESSION_TTL      # сесія продовжується з кожною дією
+        return True
+
+    def lockout_left(user_id: int) -> int:
+        """Скільки секунд ще діє блокування після невдалих спроб (0 — не заблоковано)."""
+        _, until = failures.get(user_id, [0, 0.0])
+        return max(0, int(until - time.monotonic()))
+
+    async def notify_other_admins(bot: Bot, text: str, except_id: int) -> None:
+        for admin_id in settings.admin_ids:
+            if admin_id == except_id:
+                continue
+            try:
+                await bot.send_message(admin_id, text)
+            except TelegramAPIError:
+                log.warning("Не вдалось сповістити адміністратора %s", admin_id)
+
+    def marker(name: str) -> str:
+        return {"bot": "🤖", "env": "📄", "default": "▫️"}[settings.source(name)]
+
+    def settings_home() -> tuple[str, InlineKeyboardMarkup]:
+        lines = ["⚙️ <b>Налаштування</b>",
+                 "🤖 — змінено в боті (має пріоритет), 📄 — з .env, ▫️ — за замовчуванням.",
+                 f"Сесія закривається через {SETTINGS_SESSION_TTL // 60} хв без дій."]
+        rows = []
+        for group, title in GROUPS:
+            specs = [s for s in SPECS.values() if s.group == group]
+            lines.append(f"\n<b>{title}</b>")
+            for spec in specs:
+                lines.append(f"{marker(spec.name)} {escape(spec.label)}: "
+                             f"<code>{escape(format_value(spec, getattr(settings, spec.name)))}</code>")
+            rows.append([InlineKeyboardButton(text=f"{title} ›", callback_data=f"set:g:{group}")])
+        rows.append([InlineKeyboardButton(text="📜 Журнал змін", callback_data="set:log"),
+                     InlineKeyboardButton(text="🔑 Змінити пароль", callback_data="set:pw")])
+        rows.append([InlineKeyboardButton(text="🔒 Вийти", callback_data="set:lock")])
+        return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+    def settings_group(group: str) -> tuple[str, InlineKeyboardMarkup]:
+        title = dict(GROUPS).get(group, group)
+        rows = [[InlineKeyboardButton(
+            text=f"{marker(s.name)} {s.label}: {format_value(s, getattr(settings, s.name))}"[:60],
+            callback_data=f"set:e:{s.name}")] for s in SPECS.values() if s.group == group]
+        rows.append([InlineKeyboardButton(text="◀ Назад", callback_data="set:home")])
+        return f"⚙️ <b>{escape(title)}</b>\nОбери налаштування:", InlineKeyboardMarkup(inline_keyboard=rows)
+
+    def settings_item(name: str) -> tuple[str, InlineKeyboardMarkup]:
+        spec = SPECS[name]
+        value = getattr(settings, name)
+        source = {"bot": "змінено в боті", "env": "з .env", "default": "за замовчуванням"}[settings.source(name)]
+        env_value = format_value(spec, getattr(settings.base, name))
+        lines = [f"⚙️ <b>{escape(spec.label)}</b> (<code>{spec.env}</code>)", escape(spec.help), "",
+                 f"Зараз: <b>{escape(format_value(spec, value))}</b> — {source}"]
+        if settings.is_overridden(name):
+            lines.append(f"У .env / за замовчуванням: {escape(env_value)}")
+        if name == "cabinet" and not settings.base.secret_key:
+            lines.append("\n⚠️ SECRET_KEY у .env не задано — інтеграція з кабінетом не запрацює.")
+        rows = []
+        if spec.kind == "bool":
+            rows.append([InlineKeyboardButton(text="Вимкнути" if value else "Увімкнути",
+                                              callback_data=f"set:t:{name}")])
+        elif spec.kind == "choice":
+            rows.append([InlineKeyboardButton(text=("✅ " if c == value else "") + c, callback_data=f"set:c:{name}:{c}")
+                         for c in spec.choices])
+        else:
+            rows.append([InlineKeyboardButton(text="✏️ Змінити", callback_data=f"set:v:{name}")])
+        if settings.is_overridden(name):
+            rows.append([InlineKeyboardButton(text="↩ Скинути до .env", callback_data=f"set:r:{name}")])
+        rows.append([InlineKeyboardButton(text="◀ Назад", callback_data=f"set:g:{spec.group}")])
+        return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+    async def apply_setting(bot: Bot, user_id: int, name: str, value=None, *, reset: bool = False) -> str:
+        spec = SPECS[name]
+        old, new = settings.reset(name, user_id) if reset else settings.set(name, value, user_id)
+        change = f"{spec.label}: {format_value(spec, old)} → {format_value(spec, new)}"
+        await notify_other_admins(bot, f"⚙️ Адміністратор {user_id} змінив налаштування.\n{escape(change)}"
+                                       + (" (скинуто до .env)" if reset else ""), user_id)
+        return change
+
+    async def show(target: Message, view: tuple[str, InlineKeyboardMarkup], *, edit: bool) -> None:
+        text, kb = view
+        if edit:
+            try:
+                await target.edit_text(text, reply_markup=kb)
+                return
+            except TelegramAPIError:
+                pass
+        await target.answer(text, reply_markup=kb)
+
+    async def open_settings(message: Message, state: FSMContext, user_id: int, *, edit: bool = False) -> None:
+        await state.clear()
+        if not settings.has_password:
+            await state.set_state(SettingsFlow.new_password)
+            await message.answer("🔐 Меню налаштувань захищене окремим паролем, і його ще не створено.\n"
+                                 f"Надішли новий пароль (не коротший за {MIN_PASSWORD_LEN} символів). Повідомлення з "
+                                 "паролем я одразу видалю. /cancel — скасувати.")
+            return
+        if session_active(user_id):
+            await show(message, settings_home(), edit=edit)
+            return
+        left = lockout_left(user_id)
+        if left:
+            await message.answer(f"⛔ Забагато невдалих спроб. Спробуй через {left // 60 + 1} хв.")
+            return
+        await state.set_state(SettingsFlow.password)
+        await message.answer("🔒 Введи пароль від меню налаштувань. Повідомлення з паролем я одразу видалю.\n"
+                             "/cancel — скасувати.")
+
+    @router.message(Command("settings"))
+    async def settings_command(message: Message, state: FSMContext) -> None:
+        user_id = message.from_user.id if message.from_user else 0
+        if not is_admin_private(message.chat.type, user_id):
+            return
+        await open_settings(message, state, user_id)
+
+    async def take_password(message: Message) -> str:
+        """Забирає пароль із повідомлення і видаляє його з чату."""
+        try:
+            await message.delete()
+        except TelegramAPIError:
+            pass
+        return message.text or ""
+
+    @router.message(StateFilter(SettingsFlow.password), F.text, ~F.text.startswith("/"))
+    async def settings_password(message: Message, state: FSMContext) -> None:
+        user_id = message.from_user.id if message.from_user else 0
+        password = await take_password(message)
+        if not is_admin_private(message.chat.type, user_id):
+            await state.clear()
+            return
+        if lockout_left(user_id):
+            await state.clear()
+            await message.answer(f"⛔ Забагато невдалих спроб. Спробуй через {lockout_left(user_id) // 60 + 1} хв.")
+            return
+        if settings.check_password(password):
+            failures.pop(user_id, None)
+            unlocked[user_id] = time.monotonic() + SETTINGS_SESSION_TTL
+            await state.clear()
+            await show(message, settings_home(), edit=False)
+            return
+        count = failures.setdefault(user_id, [0, 0.0])
+        count[0] += 1
+        if count[0] >= SETTINGS_MAX_FAILURES:
+            count[0], count[1] = 0, time.monotonic() + SETTINGS_LOCKOUT
+            await state.clear()
+            log.warning("Меню налаштувань: %d невдалих спроб від %s — блокування", SETTINGS_MAX_FAILURES, user_id)
+            await message.answer(f"⛔ Невірний пароль. Вхід заблоковано на {SETTINGS_LOCKOUT // 60} хв.")
+            await notify_other_admins(message.bot, f"⚠️ {SETTINGS_MAX_FAILURES} невдалих спроб входу в меню "
+                                                   f"налаштувань від адміністратора {user_id}.", user_id)
+            return
+        await message.answer(f"❌ Невірний пароль. Залишилось спроб: {SETTINGS_MAX_FAILURES - count[0]}.")
+
+    @router.message(StateFilter(SettingsFlow.new_password), F.text, ~F.text.startswith("/"))
+    async def settings_new_password(message: Message, state: FSMContext) -> None:
+        user_id = message.from_user.id if message.from_user else 0
+        password = await take_password(message)
+        if not is_admin_private(message.chat.type, user_id):
+            await state.clear()
+            return
+        if settings.has_password and not session_active(user_id):   # зміна пароля — лише з відкритої сесії
+            await state.clear()
+            await message.answer("Сесія завершилась. Відкрий /settings ще раз.")
+            return
+        if len(password) < MIN_PASSWORD_LEN:
+            await message.answer(f"Пароль закороткий: потрібно щонайменше {MIN_PASSWORD_LEN} символів. "
+                                 "Надішли інший або /cancel.")
+            return
+        await state.update_data(pw_hash=hash_password(password))     # сам пароль у пам'яті не тримаємо
+        await state.set_state(SettingsFlow.confirm_password)
+        await message.answer("Повтори пароль ще раз.")
+
+    @router.message(StateFilter(SettingsFlow.confirm_password), F.text, ~F.text.startswith("/"))
+    async def settings_confirm_password(message: Message, state: FSMContext) -> None:
+        user_id = message.from_user.id if message.from_user else 0
+        password = await take_password(message)
+        if not is_admin_private(message.chat.type, user_id):
+            await state.clear()
+            return
+        if not verify_password(password, (await state.get_data()).get("pw_hash")):
+            await state.set_state(SettingsFlow.new_password)
+            await message.answer("Паролі не збігаються. Надішли новий пароль ще раз або /cancel.")
+            return
+        changed = settings.has_password
+        settings.set_password(password)
+        await state.clear()
+        unlocked[user_id] = time.monotonic() + SETTINGS_SESSION_TTL
+        log.warning("Меню налаштувань: адміністратор %s %s пароль", user_id, "змінив" if changed else "створив")
+        await notify_other_admins(message.bot, f"🔐 Адміністратор {user_id} "
+                                               f"{'змінив' if changed else 'створив'} пароль меню налаштувань.", user_id)
+        await message.answer("✅ Пароль " + ("змінено." if changed else "створено."))
+        await show(message, settings_home(), edit=False)
+
+    @router.message(StateFilter(SettingsFlow.value), F.text, ~F.text.startswith("/"))
+    async def settings_value(message: Message, state: FSMContext) -> None:
+        user_id = message.from_user.id if message.from_user else 0
+        name = (await state.get_data()).get("setting")
+        spec = SPECS.get(name)
+        if spec and spec.kind == "secret":
+            raw = await take_password(message)
+        else:
+            raw = message.text or ""
+        if not is_admin_private(message.chat.type, user_id) or spec is None:
+            await state.clear()
+            return
+        if not session_active(user_id):
+            await state.clear()
+            await message.answer("Сесія завершилась. Відкрий /settings ще раз.")
+            return
+        try:
+            change = await apply_setting(message.bot, user_id, name, parse_value(spec, raw))
+        except SettingError as exc:
+            await message.answer(f"❌ {escape(str(exc))}\nНадішли інше значення або /cancel.")
+            return
+        await state.clear()
+        await message.answer(f"✅ {escape(change)}")
+        await show(message, settings_item(name), edit=False)
+
+    @router.callback_query(F.data.regexp(r"^set:"))
+    async def settings_action(cb: CallbackQuery, state: FSMContext) -> None:
+        user_id = cb.from_user.id
+        if not is_admin_private(cb.message.chat.type, user_id):
+            await cb.answer("Лише для адміністраторів, у приватному чаті.", show_alert=True)
+            return
+        parts = cb.data.split(":")
+        action = parts[1]
+        if action == "open":
+            await cb.answer()
+            await open_settings(cb.message, state, user_id)
+            return
+        if not session_active(user_id):
+            await cb.answer("Сесія завершилась — відкрий /settings і введи пароль.", show_alert=True)
+            return
+        name = parts[2] if len(parts) > 2 else None
+        if name is not None and action in {"e", "t", "c", "r", "v"} and name not in SPECS:
+            await cb.answer("Невідоме налаштування.", show_alert=True)
+            return
+        await state.clear()
+        toast = None
+        if action == "home":
+            await show(cb.message, settings_home(), edit=True)
+        elif action == "g":
+            await show(cb.message, settings_group(name), edit=True)
+        elif action == "e":
+            await show(cb.message, settings_item(name), edit=True)
+        elif action == "t":
+            toast = await apply_setting(cb.bot, user_id, name, not getattr(settings, name))
+            await show(cb.message, settings_item(name), edit=True)
+        elif action == "c":
+            try:
+                toast = await apply_setting(cb.bot, user_id, name, parse_value(SPECS[name], parts[3]))
+            except (SettingError, IndexError):
+                await cb.answer("Невідоме значення.", show_alert=True)
+                return
+            await show(cb.message, settings_item(name), edit=True)
+        elif action == "r":
+            toast = await apply_setting(cb.bot, user_id, name, reset=True)
+            await show(cb.message, settings_item(name), edit=True)
+        elif action == "v":
+            spec = SPECS[name]
+            await state.set_state(SettingsFlow.value)
+            await state.update_data(setting=name)
+            hint = {"int": f"ціле число від {format_number(spec.lo)} до {format_number(spec.hi)}",
+                    "float": f"число від {format_number(spec.lo)} до {format_number(spec.hi)}",
+                    "ids": "ID через кому або «-», щоб зняти обмеження",
+                    "secret": "токен xoxb-… або «-», щоб прибрати (повідомлення одразу видалю)"}.get(spec.kind, "")
+            await cb.message.answer(f"Надішли нове значення для «{escape(spec.label)}»: {hint}.\n/cancel — скасувати.")
+        elif action == "log":
+            items = settings.audit()[-15:]
+            lines = ["📜 <b>Журнал змін</b> (останні 15)"] if items else ["Змін ще не було."]
+            for e in reversed(items):
+                spec = SPECS.get(e.get("name"))
+                when = time.strftime("%d.%m %H:%M", time.localtime(e.get("t", 0)))
+                label = spec.label if spec else e.get("name")
+                lines.append(f"{when} · {e.get('user')} · {escape(str(label))}: {escape(str(e.get('old')))} → "
+                             f"{escape(str(e.get('new')))}" + (" ↩" if e.get("reset") else ""))
+            await show(cb.message, ("\n".join(lines), InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="◀ Назад", callback_data="set:home")]])), edit=True)
+        elif action == "pw":
+            await state.set_state(SettingsFlow.new_password)
+            await cb.message.answer(f"Надішли новий пароль (не коротший за {MIN_PASSWORD_LEN} символів). "
+                                    "Повідомлення одразу видалю. /cancel — скасувати.")
+        elif action == "lock":
+            unlocked.pop(user_id, None)
+            await show(cb.message, ("🔒 Меню налаштувань закрито.", None), edit=True)
+        await cb.answer(toast[:190] if toast else None)
+
     # --- панель адміністратора --------------------------------------------
     def stats_text() -> str:
         s = db.stats()
@@ -1261,7 +1581,7 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
                 f"Чатів із графіком: {len(db.graph_targets())}\n"
                 f"Адрес із фільтром за чергою: {s['with_queue']}\n"
                 + (f"Адрес із чергою з кабінету: {s['with_cabinet']} (акаунтів: {s['cabinet_accounts']})\n"
-                   if cabinet is not None else "") +
+                   if cabinet_on() else "") +
                 f"Останній цикл: {last} ({monitor.last_poll_summary})\n"
                 f"Інтервал: {settings.poll_interval} с")
 
@@ -1275,11 +1595,13 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
             [btn("🖼 Показати картинку-графік", "adm:show_img")],
             [btn("📤 Розіслати текстовий графік", "adm:send_text")],
             [btn("📤 Розіслати картинку-графік", "adm:send_img")],
+            [btn("⚙️ Налаштування (з паролем)", "set:open")],
         ])
 
     ADMIN_HELP = ("<b>Панель адміністратора</b>\n"
                   "«Показати» — лише тобі. «Розіслати» — усім чатам, що ввімкнули «Графік» (з підтвердженням); "
-                  "автоматично графік надсилається сам, щойно змінюється на сайті.")
+                  "автоматично графік надсилається сам, щойно змінюється на сайті.\n"
+                  "«⚙️ Налаштування» (або /settings) — параметри сервісу без редагування .env, під окремим паролем.")
 
     @router.message(Command("admin"))
     async def admin(message: Message) -> None:

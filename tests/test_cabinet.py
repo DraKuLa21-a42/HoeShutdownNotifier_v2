@@ -466,3 +466,10 @@ async def test_group_add_skips_cabinet_step(bot_env):
     await send(cb("st:0", chat_type="group", chat_id=-7))
     await send(msg("12", chat_type="group", chat_id=-7))
     assert db.count_for_target("tg", "-7") == 1
+
+
+async def test_sync_skipped_when_disabled_in_settings():
+    db, site, sink, mon, acc, sub = await sync_env()
+    mon.cabinet_enabled = False
+    assert (await mon.sync_cabinet()).accounts == 0
+    assert not [r for r in site.requests if "/get-oms-data/" in r.url.path]

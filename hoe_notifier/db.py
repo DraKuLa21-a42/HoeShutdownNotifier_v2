@@ -577,6 +577,11 @@ class Database:
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
             self._conn.commit()
 
+    def kv_delete(self, key: str) -> None:
+        with self._lock:
+            self._conn.execute("DELETE FROM kv WHERE key=?", (key,))
+            self._conn.commit()
+
     def stats(self) -> dict[str, int]:
         with self._lock:
             c = self._conn
