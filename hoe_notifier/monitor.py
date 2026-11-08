@@ -8,12 +8,15 @@ import random
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Awaitable, Callable
+from typing import TYPE_CHECKING, Awaitable, Callable
 
-from .db import AddressState, Database, GraphTarget, Subscription
+from .db import CABINET_AUTH_FAILED, AddressState, CabinetAccount, Database, GraphTarget, Subscription
 from .hoe import NO_OUTAGES, HoeClient, HoeUnavailable, ParseStatus, Parsed, parse_events
-from .queues import filter_schedule, outage_view
+from .queues import filter_schedule, normalize_queue, outage_view
 from .sinks import Sink, TargetGone, TargetMigrated
+
+if TYPE_CHECKING:
+    from .cabinet import CabinetService
 
 log = logging.getLogger(__name__)
 
@@ -24,6 +27,8 @@ FAILURE_ALERT_AFTER = 3  # поспіль невдалих циклів, пер�
 FAIL_FAST_AFTER = 3      # скільки адрес поспіль мають не відповісти, щоб перервати цикл
 TEXT_GRAPH_SUBJECT = "Графік погодинних відключень"
 MANUAL_REFRESH_MAX_AGE = 60  # /check та додавання адреси не б'ють у сайт частіше, ніж раз на стільки секунд
+SUBJECT_QUEUE_CHANGED = "Змінилась черга відключень"
+SUBJECT_CABINET_AUTH = "Особистий кабінет: не вдалося увійти"
 
 
 @dataclass
@@ -37,6 +42,17 @@ class GraphReport:
     text_sent: int = 0          # скільком чатам доставлено текст
     error: str | None = None
     text: str | None = None     # текст графіка, як він на сайті
+
+
+@dataclass
+class CabinetSyncReport:
+    """Підсумок оновлення черг із кабінету."""
+    accounts: int = 0
+    ok: int = 0
+    failed: int = 0
+    errors: list[str] = dataclasses.field(default_factory=list)
+    changed: list[tuple[str, str | None, str]] = dataclasses.field(default_factory=list)  # (адреса, було, стало)
+    queues: list[tuple[str, str | None]] = dataclasses.field(default_factory=list)       # (адреса, черга)
 
 
 def subject_none(queue: str | None = None) -> str:
@@ -66,6 +82,8 @@ class Monitor:
         concurrency: int = 3,
         admin_notify: Callable[[str], Awaitable[None]] | None = None,
         send_delay: float = 0.05,
+        cabinet: CabinetService | None = None,
+        cabinet_interval: int = 21600,
     ) -> None:
         self.db = db
         self.hoe = hoe
@@ -82,6 +100,10 @@ class Monitor:
         self._fetched: dict[tuple[str, str], tuple[float, Parsed]] = {}
         self._fail_streak = 0
         self._abort_cycle = False
+        self.cabinet = cabinet
+        self.cabinet_interval = cabinet_interval
+        self.cabinet_synced_at: float | None = None   # time.monotonic() останнього оновлення черг
+        self._cabinet_lock = asyncio.Lock()
 
     # --- одна адреса ----------------------------------------------------
     async def refresh_address(self, street_id: str, house: str, *, max_age: float = 0) -> Parsed | None:
@@ -219,8 +241,104 @@ class Monitor:
     async def check_graphs(self) -> None:
         await self.send_graphs()
 
+    # --- черги з особистого кабінету --------------------------------------
+    async def sync_cabinet(self, *, account_id: int | None = None) -> CabinetSyncReport:
+        """Оновлює черги адрес, прив'язаних до кабінету; зміни застосовує одразу й повідомляє чат.
+
+        Без `account_id` — усі акаунти, крім тих, де пароль перестав підходити (не довбемо сайт невірним паролем,
+        поки користувач не оновить його в /cabinet). З `account_id` — лише цей акаунт (кнопка «Оновити зараз»).
+        """
+        report = CabinetSyncReport()
+        if self.cabinet is None:
+            return report
+        async with self._cabinet_lock:
+            if account_id is None:
+                accounts = [a for a in self.db.cabinet_accounts_in_use() if a.status != CABINET_AUTH_FAILED]
+            else:
+                acc = self.db.get_cabinet_account(account_id)
+                accounts = [acc] if acc else []
+            for acc in accounts:
+                report.accounts += 1
+                await self._sync_account(acc, report)
+            if account_id is None:
+                self.cabinet_synced_at = time.monotonic()
+        return report
+
+    async def _sync_account(self, acc: CabinetAccount, report: CabinetSyncReport) -> None:
+        from .cabinet import CabinetAuthError, CabinetError, mask_login, pick_queue
+
+        subs = self.db.cabinet_links(acc.id)
+        fetched: dict[int, object] = {}
+        try:
+            for sub in subs:
+                if sub.cabinet_id not in fetched:
+                    fetched[sub.cabinet_id] = await self.cabinet.oms(acc, sub.cabinet_id)
+                entry = pick_queue(fetched[sub.cabinet_id], sub.house)
+                queue = normalize_queue(entry.queue) if entry else None
+                if queue is None:
+                    log.warning("Кабінет %s: для адреси %s черги немає або вона невідома (%r)",
+                                acc.id, sub.label, entry.queue if entry else None)
+                    report.queues.append((sub.label, sub.queue))
+                    continue
+                report.queues.append((sub.label, queue))
+                if queue != sub.queue:
+                    await self._apply_cabinet_queue(sub, queue)
+                    report.changed.append((sub.label, sub.queue, queue))
+        except CabinetAuthError as exc:
+            report.failed += 1
+            report.errors.append(f"{mask_login(acc.login)}: {exc}")
+            log.warning("Кабінет %s (%s): вхід не вдався — %s", acc.id, mask_login(acc.login), exc)
+            if acc.status != CABINET_AUTH_FAILED:      # повідомляємо лише один раз, при зміні статусу
+                await self._notify_owner(
+                    acc.owner_id, SUBJECT_CABINET_AUTH,
+                    f"Логін {mask_login(acc.login)}: пароль більше не підходить. Черги адрес "
+                    "не оновлюватимуться, доки ти не вкажеш новий пароль у /cabinet (остання відома черга "
+                    "лишається).")
+            return
+        except CabinetError as exc:
+            report.failed += 1
+            report.errors.append(f"{mask_login(acc.login)}: {exc}")
+            self.db.set_cabinet_error(acc.id, str(exc))
+            log.warning("Кабінет %s: %s", acc.id, exc)
+            return
+        self.db.mark_cabinet_synced(acc.id)
+        report.ok += 1
+
+    async def _apply_cabinet_queue(self, sub: Subscription, queue: str) -> None:
+        old = sub.queue
+        sub = self.db.set_queue(sub.id, queue, keep_cabinet=True)
+        log.info("Адреса %s: черга з кабінету %s → %s", sub.label, old, queue)
+        state = self.db.get_state(sub.street_id, sub.house)
+        body = (f"Нова черга: {queue}" + (f" (була {old})" if old else "") + " — за даними особистого кабінету.\n\n"
+                + describe_state(state, queue))
+        await self._send(sub, "send_text", SUBJECT_QUEUE_CHANGED, label_for(sub), body, silent=sub.silent)
+
+    async def _notify_owner(self, owner_id: int, subject: str, body: str) -> None:
+        sink = self.sinks.get("tg")
+        if sink is None:
+            return
+        try:
+            await sink.send_text(str(owner_id), subject, "", body, silent=False, pre=False)
+        except Exception:
+            log.warning("Не вдалось написати власнику кабінету %s", owner_id, exc_info=True)
+
+    async def maybe_sync_cabinet(self) -> None:
+        if self.cabinet is None:
+            return
+        if self.cabinet_synced_at is not None and time.monotonic() - self.cabinet_synced_at < self.cabinet_interval:
+            return
+        report = await self.sync_cabinet()
+        if report.accounts:
+            log.info("Кабінет: акаунтів %d, успішно %d, змін черги %d", report.accounts, report.ok,
+                     len(report.changed))
+
     # --- цикл -----------------------------------------------------------
     async def poll_once(self) -> None:
+        # спершу черги з кабінету — щоб сповіщення цього циклу вже йшли за актуальною чергою
+        try:
+            await self.maybe_sync_cabinet()
+        except Exception:
+            log.exception("Помилка оновлення черг із кабінету")
         addresses = self.db.event_addresses()
         sem = asyncio.Semaphore(self.concurrency)
 

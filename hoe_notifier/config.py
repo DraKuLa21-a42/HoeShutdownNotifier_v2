@@ -59,6 +59,13 @@ class Settings:
     default_silent: bool
     default_graphs: bool
     log_level: str
+    cabinet_key: str | None = None            # CABINET_SECRET_KEY; None — інтеграцію з кабінетом вимкнено
+    cabinet_base_url: str = "https://cabinet.hoe.com.ua"
+    cabinet_sync_interval: int = 21600        # секунд між оновленнями черг із кабінету
+
+    @property
+    def cabinet_enabled(self) -> bool:
+        return bool(self.cabinet_key)
 
 
 def load_settings(env_file: Path | None = None) -> Settings:
@@ -82,7 +89,18 @@ def load_settings(env_file: Path | None = None) -> Settings:
         default_silent=_bool(env("DEFAULT_SILENT"), True),
         default_graphs=_bool(env("DEFAULT_GRAPHS"), False),
         log_level=(env("LOG_LEVEL") or "INFO").upper(),
+        cabinet_key=(env("CABINET_SECRET_KEY") or "").strip() or None,
+        cabinet_base_url=(env("CABINET_BASE_URL") or "https://cabinet.hoe.com.ua").rstrip("/"),
+        cabinet_sync_interval=max(900, int(env("CABINET_SYNC_INTERVAL", "21600"))),
     )
+    if settings.cabinet_key:
+        from .cabinet import validate_key
+        try:
+            validate_key(settings.cabinet_key)
+        except ValueError as exc:
+            raise ConfigError(
+                "CABINET_SECRET_KEY має бути ключем Fernet. Згенеруй: python -c \"from cryptography.fernet "
+                "import Fernet; print(Fernet.generate_key().decode())\"") from exc
     if not settings.bot_token and not settings.slack_token:
         raise ConfigError("Потрібен BOT_TOKEN (Telegram) і/або SLACK_TOKEN. Див. .env.example")
     return settings

@@ -4,7 +4,7 @@ from __future__ import annotations
 import sqlite3
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 SCHEMA = """
@@ -22,6 +22,8 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     source     TEXT    NOT NULL DEFAULT 'bot',     -- bot | config
     owner_id   INTEGER,
     created_at INTEGER NOT NULL,
+    cabinet_account_id INTEGER,                    -- черга береться з особистого кабінету (cabinet_accounts.id)
+    cabinet_id INTEGER,                            -- договір у кабінеті (cabinetId)
     UNIQUE (channel, target, street_id, house)
 );
 CREATE TABLE IF NOT EXISTS address_state (
@@ -40,10 +42,25 @@ CREATE TABLE IF NOT EXISTS slack_bots (
     created_at INTEGER NOT NULL,
     UNIQUE (owner_id, token)
 );
+CREATE TABLE IF NOT EXISTS cabinet_accounts (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_id     INTEGER NOT NULL,                 -- Telegram-користувач
+    login        TEXT    NOT NULL,
+    password     TEXT    NOT NULL,                 -- зашифровано (Fernet, CABINET_SECRET_KEY)
+    token        TEXT,                             -- зашифровано
+    token_exp    INTEGER,
+    status       TEXT    NOT NULL DEFAULT 'ok',    -- ok | auth_failed
+    last_error   TEXT,
+    last_sync_at INTEGER,
+    created_at   INTEGER NOT NULL,
+    UNIQUE (owner_id, login)
+);
 CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 """
 
 TOGGLE_FIELDS = {"events", "graphs", "silent"}
+CABINET_OK = "ok"
+CABINET_AUTH_FAILED = "auth_failed"
 
 
 @dataclass(frozen=True)
@@ -60,6 +77,29 @@ class Subscription:
     source: str
     owner_id: int | None
     queue: str | None = None
+    cabinet_account_id: int | None = None
+    cabinet_id: int | None = None
+
+    @property
+    def queue_from_cabinet(self) -> bool:
+        return self.cabinet_account_id is not None
+
+
+@dataclass(frozen=True)
+class CabinetAccount:
+    id: int
+    owner_id: int
+    login: str
+    status: str
+    last_error: str | None
+    last_sync_at: int | None
+    password_enc: str = field(repr=False, default="")
+    token_enc: str | None = field(repr=False, default=None)
+    token_exp: int | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.status == CABINET_OK
 
 
 @dataclass(frozen=True)
@@ -103,6 +143,15 @@ def _sub(row: sqlite3.Row) -> Subscription:
         street_id=row["street_id"], house=row["house"], label=row["label"],
         events=bool(row["events"]), graphs=bool(row["graphs"]), silent=bool(row["silent"]),
         source=row["source"], owner_id=row["owner_id"], queue=row["queue"],
+        cabinet_account_id=row["cabinet_account_id"], cabinet_id=row["cabinet_id"],
+    )
+
+
+def _cabinet(row: sqlite3.Row) -> CabinetAccount:
+    return CabinetAccount(
+        id=row["id"], owner_id=row["owner_id"], login=row["login"], status=row["status"],
+        last_error=row["last_error"], last_sync_at=row["last_sync_at"], password_enc=row["password"],
+        token_enc=row["token"], token_exp=row["token_exp"],
     )
 
 
@@ -123,6 +172,10 @@ class Database:
         cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(subscriptions)")}
         if "queue" not in cols:
             self._conn.execute("ALTER TABLE subscriptions ADD COLUMN queue TEXT")
+        if "cabinet_account_id" not in cols:
+            self._conn.execute("ALTER TABLE subscriptions ADD COLUMN cabinet_account_id INTEGER")
+        if "cabinet_id" not in cols:
+            self._conn.execute("ALTER TABLE subscriptions ADD COLUMN cabinet_id INTEGER")
 
     def close(self) -> None:
         with self._lock:
@@ -133,14 +186,16 @@ class Database:
         self, channel: str, target: str, street_id: str, house: str, label: str,
         *, events: bool = True, graphs: bool = False, silent: bool = True,
         source: str = "bot", owner_id: int | None = None, queue: str | None = None,
+        cabinet_account_id: int | None = None, cabinet_id: int | None = None,
     ) -> tuple[Subscription, bool]:
         with self._lock:
             cur = self._conn.execute(
                 "INSERT OR IGNORE INTO subscriptions "
-                "(channel,target,street_id,house,label,events,graphs,silent,source,owner_id,created_at,queue) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                "(channel,target,street_id,house,label,events,graphs,silent,source,owner_id,created_at,queue,"
+                "cabinet_account_id,cabinet_id) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (channel, str(target), street_id, house, label, int(events), int(graphs),
-                 int(silent), source, owner_id, int(time.time()), queue),
+                 int(silent), source, owner_id, int(time.time()), queue, cabinet_account_id, cabinet_id),
             )
             self._conn.commit()
             created = cur.rowcount > 0
@@ -239,12 +294,107 @@ class Database:
             self._conn.commit()
         return cur.rowcount > 0
 
-    def set_queue(self, sub_id: int, queue: str | None) -> Subscription | None:
-        """Задає підчергу адреси (None — усі черги)."""
+    def set_queue(self, sub_id: int, queue: str | None, *, keep_cabinet: bool = False) -> Subscription | None:
+        """Задає підчергу адреси (None — усі черги).
+
+        Ручна зміна (`keep_cabinet=False`) відв'язує адресу від кабінету: користувач свідомо обрав іншу чергу.
+        """
         with self._lock:
-            self._conn.execute("UPDATE subscriptions SET queue=? WHERE id=?", (queue, sub_id))
+            if keep_cabinet:
+                self._conn.execute("UPDATE subscriptions SET queue=? WHERE id=?", (queue, sub_id))
+            else:
+                self._conn.execute(
+                    "UPDATE subscriptions SET queue=?, cabinet_account_id=NULL, cabinet_id=NULL WHERE id=?",
+                    (queue, sub_id))
             self._conn.commit()
         return self.get_subscription(sub_id)
+
+    def link_cabinet(self, sub_id: int, account_id: int, cabinet_id: int, queue: str | None) -> Subscription | None:
+        """Черга адреси тепер береться з кабінету (і одразу встановлюється)."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE subscriptions SET queue=?, cabinet_account_id=?, cabinet_id=? WHERE id=?",
+                (queue, account_id, cabinet_id, sub_id))
+            self._conn.commit()
+        return self.get_subscription(sub_id)
+
+    # --- акаунти особистого кабінету ---------------------------------------
+    def upsert_cabinet_account(self, owner_id: int, login: str, password_enc: str) -> CabinetAccount:
+        """Новий акаунт або новий пароль для наявного (статус скидається на ok, старий токен — геть)."""
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO cabinet_accounts (owner_id,login,password,status,created_at) VALUES (?,?,?,?,?) "
+                "ON CONFLICT(owner_id,login) DO UPDATE SET password=excluded.password, status=excluded.status, "
+                "token=NULL, token_exp=NULL, last_error=NULL",
+                (owner_id, login, password_enc, CABINET_OK, int(time.time())))
+            self._conn.commit()
+            row = self._conn.execute(
+                "SELECT * FROM cabinet_accounts WHERE owner_id=? AND login=?", (owner_id, login)).fetchone()
+        return _cabinet(row)
+
+    def get_cabinet_account(self, account_id: int) -> CabinetAccount | None:
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM cabinet_accounts WHERE id=?", (account_id,)).fetchone()
+        return _cabinet(row) if row else None
+
+    def list_cabinet_accounts(self, owner_id: int) -> list[CabinetAccount]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM cabinet_accounts WHERE owner_id=? ORDER BY id", (owner_id,)).fetchall()
+        return [_cabinet(r) for r in rows]
+
+    def cabinet_accounts_in_use(self) -> list[CabinetAccount]:
+        """Акаунти, до яких прив'язана хоча б одна адреса (лише їх синхронізуємо)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM cabinet_accounts WHERE id IN "
+                "(SELECT DISTINCT cabinet_account_id FROM subscriptions WHERE cabinet_account_id IS NOT NULL) "
+                "ORDER BY id").fetchall()
+        return [_cabinet(r) for r in rows]
+
+    def cabinet_links(self, account_id: int) -> list[Subscription]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM subscriptions WHERE cabinet_account_id=? ORDER BY id", (account_id,)).fetchall()
+        return [_sub(r) for r in rows]
+
+    def save_cabinet_token(self, account_id: int, token_enc: str, token_exp: int) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE cabinet_accounts SET token=?, token_exp=?, status=?, last_error=NULL WHERE id=?",
+                (token_enc, int(token_exp), CABINET_OK, account_id))
+            self._conn.commit()
+
+    def set_cabinet_status(self, account_id: int, status: str, error: str | None = None) -> None:
+        with self._lock:
+            self._conn.execute("UPDATE cabinet_accounts SET status=?, last_error=? WHERE id=?",
+                               (status, error, account_id))
+            self._conn.commit()
+
+    def set_cabinet_error(self, account_id: int, error: str | None) -> None:
+        """Тимчасова помилка (сайт недоступний) — статус не змінюється."""
+        with self._lock:
+            self._conn.execute("UPDATE cabinet_accounts SET last_error=? WHERE id=?", (error, account_id))
+            self._conn.commit()
+
+    def mark_cabinet_synced(self, account_id: int) -> None:
+        with self._lock:
+            self._conn.execute("UPDATE cabinet_accounts SET last_sync_at=?, last_error=NULL WHERE id=?",
+                               (int(time.time()), account_id))
+            self._conn.commit()
+
+    def delete_cabinet_account(self, account_id: int) -> int:
+        """Видаляє логін, пароль і токен; прив'язані адреси зберігають останню чергу, але вже як ручну.
+
+        Повертає кількість відв'язаних адрес.
+        """
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE subscriptions SET cabinet_account_id=NULL, cabinet_id=NULL WHERE cabinet_account_id=?",
+                (account_id,))
+            self._conn.execute("DELETE FROM cabinet_accounts WHERE id=?", (account_id,))
+            self._conn.commit()
+        return cur.rowcount
 
     def toggle(self, sub_id: int, field: str) -> Subscription | None:
         if field not in TOGGLE_FIELDS:
@@ -383,6 +533,9 @@ class Database:
             return {
                 "subscriptions": c.execute("SELECT COUNT(*) FROM subscriptions").fetchone()[0],
                 "with_queue": c.execute("SELECT COUNT(*) FROM subscriptions WHERE queue IS NOT NULL").fetchone()[0],
+                "with_cabinet": c.execute(
+                    "SELECT COUNT(*) FROM subscriptions WHERE cabinet_account_id IS NOT NULL").fetchone()[0],
+                "cabinet_accounts": c.execute("SELECT COUNT(*) FROM cabinet_accounts").fetchone()[0],
                 "targets": c.execute(
                     "SELECT COUNT(*) FROM (SELECT DISTINCT channel,target FROM subscriptions)").fetchone()[0],
                 "addresses": c.execute(

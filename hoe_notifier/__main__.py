@@ -90,8 +90,19 @@ async def run() -> int:
     db.sync_config_subscriptions(entries)
     log.info("Адрес з addresses.toml: %d; усього підписок: %s", len(entries), db.stats())
 
+    cabinet = None
+    if settings.cabinet_enabled:
+        from .cabinet import CabinetClient, CabinetService, SecretBox
+
+        cabinet = CabinetService(
+            db, CabinetClient(settings.cabinet_base_url, timeout=settings.request_timeout,
+                              retries=settings.retries, retry_delay=settings.retry_delay),
+            SecretBox(settings.cabinet_key))
+        log.info("Особистий кабінет: увімкнено, оновлення черг кожні %d с", settings.cabinet_sync_interval)
+
     monitor = Monitor(db, hoe, sinks, poll_interval=settings.poll_interval,
-                      concurrency=settings.concurrency, admin_notify=admin_notify)
+                      concurrency=settings.concurrency, admin_notify=admin_notify,
+                      cabinet=cabinet, cabinet_interval=settings.cabinet_sync_interval)
     monitor_task = asyncio.create_task(monitor.run_forever(), name="monitor")
 
     try:
@@ -117,6 +128,8 @@ async def run() -> int:
         if bot:
             await bot.session.close()
         await hoe.aclose()
+        if cabinet:
+            await cabinet.aclose()
         db.close()
         log.info("Зупинено")
     return 0

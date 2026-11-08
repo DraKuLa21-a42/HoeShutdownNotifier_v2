@@ -19,8 +19,9 @@ from aiogram.types import (
     InlineKeyboardMarkup, Message, ChatMemberUpdated,
 )
 
+from .cabinet import CabinetAuthError, CabinetError, house_matches, mask_login, pick_queue, street_matches
 from .config import Settings
-from .db import Database, Subscription
+from .db import CabinetAccount, Database, Subscription
 from .hoe import HoeClient, SearchUnavailable, match_house, suggest_houses
 from .monitor import MANUAL_REFRESH_MAX_AGE, TEXT_GRAPH_SUBJECT, Monitor, describe_state, label_for
 from .queues import QUEUES, filter_schedule, normalize_queue
@@ -32,6 +33,7 @@ HELP = (
     "<b>Сповіщення про погодинні відключення (Хмельницькобленерго)</b>\n\n"
     "/add — додати адресу: населений пункт → вулиця → будинок (можна одразу: <code>/add Давидківці</code>)\n"
     "/slack — підключити власного Slack-бота / керувати ними\n"
+    "/cabinet — особистий кабінет cabinet.hoe.com.ua: точна черга з договору (якщо ввімкнено на сервері)\n"
     "/list — мої адреси та налаштування (сповіщення, графік, звук, черга)\n"
     "/check — перевірити всі мої адреси зараз\n"
     "/graph — показати актуальний графік (картинку та/або текст); якщо вказано чергу — лише для неї, "
@@ -41,7 +43,9 @@ HELP = (
     "/cancel — скасувати поточну дію\n\n"
     "<b>Фільтр за чергою.</b> У /list натисни «🔢 Черга» біля адреси й обери свою підчергу (1.1 – 6.2): "
     "бот надсилатиме лише відключення твоєї черги (і текстовий графік лише з нею). "
-    "Одразу під час додавання: <code>/add --queue=1.1</code>.\n\n"
+    "Одразу під час додавання: <code>/add --queue=1.1</code>.\n"
+    "Або дай боту логін і пароль від особистого кабінету — тоді черга береться з твого договору й оновлюється "
+    "автоматично (пропонується під час /add у приватному чаті; керування — /cabinet).\n\n"
     "<b>Сповіщення в канал або групу.</b> Додай бота в канал адміністратором з правом "
     "«Публікація повідомлень» і дописуй до команди <code>--to=&lt;ID каналу або @username&gt;</code>:\n"
     "<code>/add --to=-1001234567890</code>\n"
@@ -83,6 +87,24 @@ class Dest:
 
 class SlackFlow(StatesGroup):
     token = State()
+
+
+class CabinetFlow(StatesGroup):
+    """Черга з особистого кабінету. Мета розмови — у даних FSM: cab={"kind": "add"|"link"|"repass", ...}."""
+    choose = State()      # як визначити чергу / який збережений акаунт
+    login = State()
+    password = State()
+    contract = State()    # кілька договорів — вибір
+    confirm = State()     # адреса в кабінеті не збігається з доданою
+
+
+CABINET_NOTICE = (
+    "🔐 <b>Черга з особистого кабінету</b> (cabinet.hoe.com.ua)\n"
+    "Я увійду в кабінет, візьму чергу з твого договору й оновлюватиму її автоматично.\n\n"
+    "Пароль зберігається в базі бота зашифрованим — він потрібен, щоб щодня оновлювати вхід (токен кабінету "
+    "діє добу). Адміністратор сервера технічно може його розшифрувати. Якщо це неприйнятно — /cancel і вкажи "
+    "чергу вручну. Видалити логін і пароль можна будь-коли в /cabinet."
+)
 
 
 MAX_SLACK_BOTS = 3
@@ -142,11 +164,12 @@ def sub_keyboard(sub: Subscription) -> InlineKeyboardMarkup | None:
         InlineKeyboardButton(text=f"{'🔕' if sub.silent else '🔔'} Звук", callback_data=f"sub:{sub.id}:silent"),
         InlineKeyboardButton(text="🗑 Видалити", callback_data=f"sub:{sub.id}:del"),
     ]
-    row3 = [InlineKeyboardButton(text=f"🔢 Черга: {sub.queue or 'усі'}", callback_data=f"sub:{sub.id}:queue")]
+    lock = " 🔐" if sub.queue_from_cabinet else ""
+    row3 = [InlineKeyboardButton(text=f"🔢 Черга: {sub.queue or 'усі'}{lock}", callback_data=f"sub:{sub.id}:queue")]
     return InlineKeyboardMarkup(inline_keyboard=[row1, row2, row3])
 
 
-def queue_keyboard(sub: Subscription) -> InlineKeyboardMarkup:
+def queue_keyboard(sub: Subscription, cabinet: bool = False) -> InlineKeyboardMarkup:
     """Вибір підчерги: по дві в рядку (1.1 1.2 / 2.1 2.2 …), «усі» та «назад»."""
     mark = lambda q: "✅ " if sub.queue == q else ""  # noqa: E731
     rows = [
@@ -155,6 +178,9 @@ def queue_keyboard(sub: Subscription) -> InlineKeyboardMarkup:
     ]
     rows.append([InlineKeyboardButton(text=f"{'✅ ' if sub.queue is None else ''}Усі черги (без фільтра)",
                                       callback_data=f"q:{sub.id}:all")])
+    if cabinet:
+        text = "🔐 Оновити з кабінету" if sub.queue_from_cabinet else "🔐 Взяти з особистого кабінету"
+        rows.append([InlineKeyboardButton(text=text, callback_data=f"q:{sub.id}:cab")])
     rows.append([InlineKeyboardButton(text="↩ Назад", callback_data=f"q:{sub.id}:back")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -162,8 +188,9 @@ def queue_keyboard(sub: Subscription) -> InlineKeyboardMarkup:
 def sub_text(sub: Subscription, where: str | None = None) -> str:
     lock = " 🔒 (з addresses.toml)" if sub.source == "config" else ""
     dest = f"\n➡️ Куди: <b>{escape(where)}</b>" if where else ""
+    cab = "\n🔐 Черга з особистого кабінету (оновлюється автоматично)" if sub.queue_from_cabinet else ""
     return (f"📍 <b>{escape(sub.label)}</b>{lock}{dest}\n"
-            f"streetId: <code>{escape(sub.street_id)}</code>, будинок: <code>{escape(sub.house)}</code>")
+            f"streetId: <code>{escape(sub.street_id)}</code>, будинок: <code>{escape(sub.house)}</code>{cab}")
 
 
 def prompt_markup(chat_type: str) -> ForceReply | None:
@@ -173,6 +200,7 @@ def prompt_markup(chat_type: str) -> ForceReply | None:
 
 def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Monitor) -> Router:
     router = Router()
+    cabinet = monitor.cabinet          # None — інтеграцію з кабінетом вимкнено
 
     def allowed(chat_id: int, user_id: int) -> bool:
         if not settings.allowed_chat_ids or user_id in settings.admin_ids:
@@ -240,7 +268,9 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
         return chat.id, chat.title or chat.username or str(chat.id)
 
     async def finish_add(message: Message, user_id: int, street_id: str, house: str, label: str,
-                         dest: Dest | None = None, queue: str | None = None) -> None:
+                         dest: Dest | None = None, queue: str | None = None, *,
+                         cabinet_link: tuple[int, int] | None = None, ask_queue: bool = False) -> None:
+        """`cabinet_link` = (id акаунта, cabinetId) — черга з кабінету; `ask_queue` — одразу показати вибір черги."""
         slack = dest is not None and dest.channel == "slack"
         external = slack or (dest is not None and dest.target != str(message.chat.id))
         channel = "slack" if slack else "tg"
@@ -289,18 +319,25 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
         sub, _ = db.add_subscription(
             channel, chat_id, street_id, house, label,
             graphs=settings.default_graphs, silent=settings.default_silent, owner_id=user_id, queue=queue,
+            cabinet_account_id=cabinet_link[0] if cabinet_link else None,
+            cabinet_id=cabinet_link[1] if cabinet_link else None,
         )
-        hint = ("Налаштування — кнопками нижче або в /list." if queue else
-                "Щоб отримувати лише відключення своєї черги, натисни «🔢 Черга».")
+        if cabinet_link:
+            hint = "🔐 Черга з особистого кабінету — оновлюватиметься автоматично."
+        elif ask_queue:
+            hint = "Обери свою чергу кнопками нижче."
+        else:
+            hint = ("Налаштування — кнопками нижче або в /list." if queue else
+                    "Щоб отримувати лише відключення своєї черги, натисни «🔢 Черга».")
+        markup = queue_keyboard(sub, cabinet is not None) if ask_queue else sub_keyboard(sub)
         if external:
             kind = "Slack" if slack else "«" + escape(title) + "»"
             where = f"у Slack ({escape(title)})" if slack else f"в {kind}"
-            await message.answer(f"✅ Додано {where}: <b>{escape(label)}</b>\n{hint}",
-                                 reply_markup=sub_keyboard(sub))
+            await message.answer(f"✅ Додано {where}: <b>{escape(label)}</b>\n{hint}", reply_markup=markup)
         else:
             await message.answer(
                 f"✅ Додано: <b>{escape(label)}</b>\n\nПоточний стан:\n<pre>{escape(status)}</pre>\n{hint}",
-                reply_markup=sub_keyboard(sub))
+                reply_markup=markup)
 
     async def parse_queue_option(message: Message, raw: str | None) -> tuple[str | None, bool]:
         """(черга, ok). ok=False — помилку вже показано користувачу."""
@@ -519,11 +556,26 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
 
     async def complete_add(message: Message, state: FSMContext, user_id: int, house_no: str) -> None:
         data = await state.get_data()
-        await state.clear()
         label = f"{data['settlement_name']}, {data['street_name']}, {house_no}"[:80]
+        await state.update_data(house_no=house_no, label=label)
+        if cabinet is not None and message.chat.type == ChatType.PRIVATE and data.get("queue") is None:
+            # Логін і пароль приймаємо лише в приватному чаті; у групі — як раніше, без цього кроку.
+            await state.update_data(cab={"kind": "add"})
+            await state.set_state(CabinetFlow.choose)
+            await message.answer("🔢 Як визначити чергу для цієї адреси?",
+                                 reply_markup=queue_source_keyboard(user_id, adding=True))
+            return
+        await finish_from_state(message, state, user_id, queue=data.get("queue"))
+
+    async def finish_from_state(message: Message, state: FSMContext, user_id: int, *, queue: str | None = None,
+                                cabinet_link: tuple[int, int] | None = None, ask_queue: bool = False) -> None:
+        """Завершує /add даними з FSM (адреса вже обрана)."""
+        data = await state.get_data()
+        await state.clear()
         raw_dest = data.get("dest")
-        await finish_add(message, user_id, data["street_id"], house_no, label,
-                         Dest(*raw_dest) if raw_dest else None, data.get("queue"))
+        await finish_add(message, user_id, data["street_id"], data["house_no"], data["label"],
+                         Dest(*raw_dest) if raw_dest else None, queue,
+                         cabinet_link=cabinet_link, ask_queue=ask_queue)
 
     @router.message(StateFilter(AddFlow.house), F.text, ~F.text.startswith("/"))
     async def house(message: Message, state: FSMContext) -> None:
@@ -697,6 +749,358 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
         if await connect_slack(message, user_id, token):
             await state.clear()
 
+    # --- особистий кабінет: черга з договору ---------------------------------
+    def queue_source_keyboard(user_id: int, *, adding: bool) -> InlineKeyboardMarkup:
+        rows = []
+        accounts = db.list_cabinet_accounts(user_id)
+        for acc in accounts:
+            warn = "" if acc.ok else " ⚠️"
+            rows.append([InlineKeyboardButton(text=f"🔐 {mask_login(acc.login)}{warn}"[:60],
+                                              callback_data=f"cq:acc:{acc.id}")])
+        rows.append([InlineKeyboardButton(text="🔐 Інший акаунт кабінету" if accounts else "🔐 З особистого кабінету",
+                                          callback_data="cq:new")])
+        if adding:
+            rows.append([InlineKeyboardButton(text="✋ Вкажу сам", callback_data="cq:manual"),
+                         InlineKeyboardButton(text="⏭ Без черги", callback_data="cq:none")])
+        else:
+            rows.append([InlineKeyboardButton(text="✖ Скасувати", callback_data="cq:cancel")])
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    async def ask_login(message: Message, state: FSMContext) -> None:
+        await state.set_state(CabinetFlow.login)
+        await message.answer(CABINET_NOTICE + "\n\nВведи <b>логін</b> від кабінету (email або телефон). "
+                             "/cancel — скасувати.")
+
+    async def cabinet_fallback(message: Message, state: FSMContext, user_id: int, reason: str) -> None:
+        """Кабінет не допоміг: під час /add адресу все одно додаємо (з ручним вибором черги), інакше — виходимо."""
+        cab = (await state.get_data()).get("cab") or {}
+        if cab.get("kind") == "add":
+            await message.answer(f"{reason}\nДодаю адресу без цього — обери чергу вручну. Підключити кабінет "
+                                 "можна пізніше: /list → «🔢 Черга» → «🔐».")
+            await finish_from_state(message, state, user_id, ask_queue=True)
+        else:
+            await state.clear()
+            await message.answer(reason)
+
+    async def start_cabinet_link(cb: CallbackQuery, state: FSMContext, sub: Subscription) -> None:
+        """Кнопка «🔐 Взяти з особистого кабінету» в меню черги вже доданої адреси."""
+        if cabinet is None:
+            await cb.answer("Інтеграцію з кабінетом на цьому сервері не ввімкнено.", show_alert=True)
+            return
+        if cb.message.chat.type != ChatType.PRIVATE:
+            await cb.answer("Логін і пароль — лише в приватному чаті зі мною: відкрий /list там.", show_alert=True)
+            return
+        await cb.answer()
+        await state.clear()
+        await state.update_data(cab={"kind": "link", "sub_id": sub.id})
+        if sub.queue_from_cabinet and db.get_cabinet_account(sub.cabinet_account_id):
+            # уже прив'язано — просто перечитуємо чергу з того самого договору
+            await state.update_data(cab_account=sub.cabinet_account_id)
+            await choose_contract(cb.message, state, cb.from_user.id, sub.cabinet_id)
+        elif db.list_cabinet_accounts(cb.from_user.id):
+            await state.set_state(CabinetFlow.choose)
+            await cb.message.answer(f"Звідки взяти чергу для <b>{escape(sub.label)}</b>?",
+                                    reply_markup=queue_source_keyboard(cb.from_user.id, adding=False))
+        else:
+            await ask_login(cb.message, state)
+
+    @router.callback_query(StateFilter(CabinetFlow.choose), F.data.regexp(r"^cq:(new|manual|none|cancel|acc:\d+)$"))
+    async def cabinet_choose(cb: CallbackQuery, state: FSMContext) -> None:
+        if cb.message.chat.type != ChatType.PRIVATE:
+            await cb.answer()
+            return
+        key = cb.data.split(":", 1)[1]
+        await cb.answer()
+        try:
+            await cb.message.edit_reply_markup(reply_markup=None)
+        except TelegramAPIError:
+            pass
+        if key in {"manual", "none"}:
+            await finish_from_state(cb.message, state, cb.from_user.id, ask_queue=key == "manual")
+        elif key == "cancel":
+            await state.clear()
+            await cb.message.answer("Скасовано.")
+        elif key == "new":
+            await ask_login(cb.message, state)
+        else:
+            acc = db.get_cabinet_account(int(key.split(":")[1]))
+            if acc is None or acc.owner_id != cb.from_user.id:
+                await cb.message.answer("Акаунт не знайдено. Увійди заново.")
+                await ask_login(cb.message, state)
+                return
+            await use_account(cb.message, state, cb.from_user.id, acc)
+
+    @router.message(StateFilter(CabinetFlow.login), F.text, ~F.text.startswith("/"))
+    async def cabinet_login(message: Message, state: FSMContext) -> None:
+        if message.chat.type != ChatType.PRIVATE:
+            return
+        login = (message.text or "").strip()
+        if not login or len(login) > 100 or " " in login:
+            await message.answer("Це не схоже на логін. Введи email або телефон, з якими входиш у кабінет.")
+            return
+        await state.update_data(cab_login=login)
+        await state.set_state(CabinetFlow.password)
+        await message.answer("Тепер <b>пароль</b>. Повідомлення з ним я одразу видалю з чату.")
+
+    @router.message(StateFilter(CabinetFlow.password), F.text, ~F.text.startswith("/"))
+    async def cabinet_password(message: Message, state: FSMContext) -> None:
+        if message.chat.type != ChatType.PRIVATE:
+            return
+        password = (message.text or "").strip()
+        try:                                   # пароль — секрет: прибираємо його з історії чату
+            await message.delete()
+        except TelegramAPIError:
+            pass
+        user_id = message.from_user.id
+        data = await state.get_data()
+        cab = data.get("cab") or {}
+        repass = cab.get("kind") == "repass"
+        if repass:
+            acc = db.get_cabinet_account(cab.get("account_id") or 0)
+            if acc is None or acc.owner_id != user_id:
+                await state.clear()
+                await message.answer("Акаунт не знайдено.")
+                return
+            login = acc.login
+        else:
+            login = data.get("cab_login")
+            if not login:
+                await ask_login(message, state)
+                return
+        if not password:
+            await message.answer("Пароль порожній. Надішли його ще раз або /cancel.")
+            return
+        try:
+            acc = await cabinet.sign_in(user_id, login, password)
+        except CabinetAuthError:
+            if repass:
+                await message.answer("❌ Пароль не підходить. Надішли ще раз або /cancel.")
+            else:
+                await state.set_state(CabinetFlow.login)
+                await message.answer("❌ Невірний логін або пароль. Введи логін ще раз або /cancel.")
+            return
+        except CabinetError as exc:
+            log.warning("Кабінет: вхід не вдався: %s", exc)
+            await cabinet_fallback(message, state, user_id, "Особистий кабінет зараз не відповідає.")
+            return
+        if repass:
+            await state.clear()
+            report = await monitor.sync_cabinet(account_id=acc.id)
+            await message.answer(f"✅ Пароль для {escape(mask_login(acc.login))} оновлено.\n"
+                                 + cabinet_report_text(report))
+            return
+        await message.answer(f"✓ Вхід успішний: {escape(mask_login(acc.login))}")
+        await use_account(message, state, user_id, acc)
+
+    async def use_account(message: Message, state: FSMContext, user_id: int, acc: CabinetAccount) -> None:
+        """Акаунт є — беремо договори; один — одразу до черги, кілька — даємо вибрати."""
+        try:
+            contracts = await cabinet.contracts(acc)
+        except CabinetAuthError:
+            await state.update_data(cab_login=acc.login)
+            await state.set_state(CabinetFlow.password)
+            await message.answer(f"Збережений пароль для {escape(mask_login(acc.login))} більше не підходить. "
+                                 "Надішли новий пароль (повідомлення одразу видалю) або /cancel.")
+            return
+        except CabinetError as exc:
+            log.warning("Кабінет: договори: %s", exc)
+            await cabinet_fallback(message, state, user_id, "Особистий кабінет зараз не відповідає.")
+            return
+        if not contracts:
+            await cabinet_fallback(message, state, user_id, "У цьому кабінеті немає договорів.")
+            return
+        await state.update_data(cab_account=acc.id,
+                                cab_contracts=[[c.cabinet_id, c.number, c.address] for c in contracts])
+        if len(contracts) == 1:
+            await choose_contract(message, state, user_id, contracts[0].cabinet_id)
+            return
+        await state.set_state(CabinetFlow.contract)
+        def short(address: str) -> str:          # «…, м. Хмельницький, вул. Мирного П. 21, кв.11» → кінець
+            return ",".join(address.split(",")[-2:]).strip()
+        rows = [[InlineKeyboardButton(text=f"№…{c.number[-4:]} {short(c.address)}"[:60], callback_data=f"cc:{i}")]
+                for i, c in enumerate(contracts[:10])]
+        await message.answer("У кабінеті кілька договорів. Обери потрібний:",
+                             reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+    @router.callback_query(StateFilter(CabinetFlow.contract), F.data.regexp(r"^cc:\d+$"))
+    async def cabinet_contract_pick(cb: CallbackQuery, state: FSMContext) -> None:
+        contracts = (await state.get_data()).get("cab_contracts") or []
+        idx = int(cb.data.split(":")[1])
+        if idx >= len(contracts):
+            await cb.answer("Список застарів.", show_alert=True)
+            return
+        cabinet_id, number, address = contracts[idx]
+        await cb.answer()
+        await cb.message.edit_text(f"Договір №{escape(number)}\n{escape(address)}")
+        await choose_contract(cb.message, state, cb.from_user.id, cabinet_id)
+
+    async def cabinet_target(data: dict) -> tuple[str, str] | None:
+        """(будинок, повна назва адреси), для якої шукаємо чергу."""
+        cab = data.get("cab") or {}
+        if cab.get("kind") == "add":
+            return data.get("house_no", ""), data.get("label", "")
+        sub = db.get_subscription(cab.get("sub_id") or 0)
+        return (sub.house, sub.label) if sub else None
+
+    async def choose_contract(message: Message, state: FSMContext, user_id: int, cabinet_id: int) -> None:
+        data = await state.get_data()
+        acc = db.get_cabinet_account(data.get("cab_account") or 0)
+        target = await cabinet_target(data)
+        if acc is None or target is None:
+            await state.clear()
+            await message.answer("Дані застаріли, почни спочатку.")
+            return
+        try:
+            oms = await cabinet.oms(acc, cabinet_id)
+        except CabinetError as exc:
+            log.warning("Кабінет: черга: %s", exc)
+            await cabinet_fallback(message, state, user_id, "Не вдалося отримати чергу з кабінету.")
+            return
+        house, label = target
+        entry = pick_queue(oms, house)
+        queue = normalize_queue(entry.queue) if entry else None
+        if queue is None:
+            raw = f" («{escape(entry.queue)}»)" if entry and entry.queue else ""
+            await cabinet_fallback(message, state, user_id, f"У кабінеті для цього договору черга не вказана{raw}.")
+            return
+        await state.update_data(cab_cabinet_id=cabinet_id, cab_queue=queue)
+        if not (house_matches(entry.house, house) and street_matches(entry.street, label)):
+            await state.set_state(CabinetFlow.confirm)
+            kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text=f"✅ Взяти чергу {queue}", callback_data="cm:yes"),
+                InlineKeyboardButton(text="✋ Вкажу сам", callback_data="cm:no")]])
+            await message.answer(f"⚠️ Адреса в кабінеті: <b>{escape(entry.address)}</b>\n"
+                                 f"А ти додаєш: <b>{escape(label)}</b>\n\n"
+                                 f"Черга в кабінеті — {queue}. Взяти її для цієї адреси?", reply_markup=kb)
+            return
+        await apply_cabinet_queue(message, state, user_id)
+
+    @router.callback_query(StateFilter(CabinetFlow.confirm), F.data.regexp(r"^cm:(yes|no)$"))
+    async def cabinet_confirm(cb: CallbackQuery, state: FSMContext) -> None:
+        await cb.answer()
+        try:
+            await cb.message.edit_reply_markup(reply_markup=None)
+        except TelegramAPIError:
+            pass
+        if cb.data == "cm:yes":
+            await apply_cabinet_queue(cb.message, state, cb.from_user.id)
+            return
+        data = await state.get_data()
+        cab = data.get("cab") or {}
+        if cab.get("kind") == "add":
+            await finish_from_state(cb.message, state, cb.from_user.id, ask_queue=True)
+            return
+        await state.clear()
+        sub = db.get_subscription(cab.get("sub_id") or 0)
+        if sub:
+            await cb.message.answer(f"Обери чергу для <b>{escape(sub.label)}</b>:",
+                                    reply_markup=queue_keyboard(sub, cabinet is not None))
+
+    async def apply_cabinet_queue(message: Message, state: FSMContext, user_id: int) -> None:
+        data = await state.get_data()
+        cab = data.get("cab") or {}
+        queue = data["cab_queue"]
+        link = (data["cab_account"], data["cab_cabinet_id"])
+        if cab.get("kind") == "add":
+            await finish_from_state(message, state, user_id, queue=queue, cabinet_link=link)
+            return
+        await state.clear()
+        sub = db.get_subscription(cab.get("sub_id") or 0)
+        if sub is None:
+            await message.answer("Адресу не знайдено (можливо, її видалили).")
+            return
+        old = sub.queue
+        sub = db.link_cabinet(sub.id, link[0], link[1], queue)
+        change = f" (була {old})" if old and old != queue else ""
+        await message.answer(f"✅ <b>{escape(sub.label)}</b>: черга {queue}{change} з особистого кабінету.\n"
+                             "Оновлюватиметься автоматично.", reply_markup=sub_keyboard(sub))
+
+    def cabinet_report_text(report) -> str:
+        if report.failed:
+            return "❌ " + escape("; ".join(report.errors))
+        if not report.queues:
+            return "До цього акаунта не прив'язано жодної адреси."
+        lines = [f"• {escape(label)} — черга {q or '?'}" for label, q in report.queues]
+        for label, old, new in report.changed:
+            lines.append(f"⚠️ {escape(label)}: черга змінилась {old or '—'} → {new}")
+        return "Черги з кабінету:\n" + "\n".join(lines)
+
+    async def show_cabinet_menu(message: Message, user_id: int) -> None:
+        accounts = db.list_cabinet_accounts(user_id)
+        if not accounts:
+            await message.answer("🔐 Акаунтів особистого кабінету ще немає.\n\nПідключити кабінет можна під час "
+                                 "/add (крок «Як визначити чергу?») або для вже доданої адреси: /list → «🔢 Черга» "
+                                 "→ «🔐 Взяти з особистого кабінету».")
+            return
+        lines, rows = ["🔐 <b>Особистий кабінет</b>"], []
+        for acc in accounts:
+            status = "✅ працює" if acc.ok else "⚠️ пароль не підходить — натисни 🔑"
+            synced = (time.strftime("%d.%m %H:%M", time.localtime(acc.last_sync_at))
+                      if acc.last_sync_at else "ще ні")
+            lines.append(f"\n<b>№{acc.id} {escape(mask_login(acc.login))}</b> — {status}\nОновлено: {synced}"
+                         + (f"\nОстання помилка: {escape(acc.last_error)}" if acc.last_error and acc.ok else ""))
+            for sub in db.cabinet_links(acc.id):
+                lines.append(f"• {escape(sub.label)} — черга {sub.queue or '?'}")
+            if not db.cabinet_links(acc.id):
+                lines.append("• адрес не прив'язано")
+            rows.append([InlineKeyboardButton(text=f"🔄 №{acc.id}", callback_data=f"cab:sync:{acc.id}"),
+                         InlineKeyboardButton(text="🔑 Пароль", callback_data=f"cab:pass:{acc.id}"),
+                         InlineKeyboardButton(text="🗑 Видалити", callback_data=f"cab:del:{acc.id}")])
+        await message.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+    @router.message(Command("cabinet"))
+    async def cabinet_command(message: Message, state: FSMContext) -> None:
+        user_id = message.from_user.id if message.from_user else 0
+        if not allowed(message.chat.id, user_id):
+            return
+        if cabinet is None:
+            await message.answer("Інтеграцію з особистим кабінетом на цьому сервері не ввімкнено.")
+            return
+        if message.chat.type != ChatType.PRIVATE:
+            await message.answer("Логін і пароль — секрет, тож /cabinet працює лише в приватному чаті зі мною.")
+            return
+        await state.clear()
+        await show_cabinet_menu(message, user_id)
+
+    @router.callback_query(F.data.regexp(r"^cab:((sync|pass|del|delyes):\d+|no)$"))
+    async def cabinet_action(cb: CallbackQuery, state: FSMContext) -> None:
+        user_id = cb.from_user.id
+        if cabinet is None or cb.message.chat.type != ChatType.PRIVATE or not allowed(cb.message.chat.id, user_id):
+            await cb.answer("Лише в приватному чаті.", show_alert=True)
+            return
+        parts = cb.data.split(":")
+        if parts[1] == "no":
+            await cb.message.edit_text("Скасовано.")
+            await cb.answer()
+            return
+        acc = db.get_cabinet_account(int(parts[2]))
+        if acc is None or acc.owner_id != user_id:
+            await cb.answer("Акаунт не знайдено.", show_alert=True)
+            return
+        masked = escape(mask_login(acc.login))
+        if parts[1] == "sync":
+            await cb.answer("Оновлюю…")
+            report = await monitor.sync_cabinet(account_id=acc.id)
+            await cb.message.answer(f"🔄 {masked}\n" + cabinet_report_text(report))
+        elif parts[1] == "pass":
+            await cb.answer()
+            await state.clear()
+            await state.update_data(cab={"kind": "repass", "account_id": acc.id})
+            await state.set_state(CabinetFlow.password)
+            await cb.message.answer(f"Введи новий пароль для {masked}. Повідомлення одразу видалю. /cancel — скасувати.")
+        elif parts[1] == "del":
+            await cb.answer()
+            kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="✅ Так, видалити", callback_data=f"cab:delyes:{acc.id}"),
+                InlineKeyboardButton(text="✖ Ні", callback_data="cab:no")]])
+            await cb.message.answer(f"Видалити логін, пароль і токен {masked}? Прив'язані адреси залишаться "
+                                    f"з останньою чергою, але вона більше не оновлюватиметься "
+                                    f"({len(db.cabinet_links(acc.id))}).", reply_markup=kb)
+        else:
+            unlinked = db.delete_cabinet_account(acc.id)
+            await cb.answer()
+            await cb.message.edit_text(f"🗑 {masked} видалено разом із паролем. Адрес відв'язано: {unlinked}.")
+
     # --- список і керування -----------------------------------------------
     async def chat_title(bot: Bot, chat_id: str) -> str:
         try:
@@ -767,17 +1171,20 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
             db.delete_subscription(sub.id)
             await cb.message.edit_text(f"🗑 Видалено: <b>{escape(sub.label)}</b>")
         elif action == "queue":
-            await cb.message.edit_reply_markup(reply_markup=queue_keyboard(sub))
+            await cb.message.edit_reply_markup(reply_markup=queue_keyboard(sub, cabinet is not None))
         else:
             sub = db.toggle(sub.id, action)
             await cb.message.edit_reply_markup(reply_markup=sub_keyboard(sub))
         await cb.answer()
 
-    @router.callback_query(F.data.regexp(r"^q:\d+:(\d\.\d|all|back)$"))
-    async def queue_action(cb: CallbackQuery) -> None:
+    @router.callback_query(F.data.regexp(r"^q:\d+:(\d\.\d|all|back|cab)$"))
+    async def queue_action(cb: CallbackQuery, state: FSMContext) -> None:
         _, sub_id, value = cb.data.split(":")
         sub = db.get_subscription(int(sub_id))
         if not await authorize_sub(cb, sub):
+            return
+        if value == "cab":
+            await start_cabinet_link(cb, state, sub)
             return
         toast = None
         if value != "back":
@@ -785,8 +1192,11 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
             if value != "all" and queue is None:
                 await cb.answer(f"Невідома черга. Доступні: {QUEUES_HINT}.", show_alert=True)
                 return
-            sub = db.set_queue(sub.id, queue)
+            was_linked = sub.queue_from_cabinet
+            sub = db.set_queue(sub.id, queue)          # ручний вибір відв'язує адресу від кабінету
             toast = f"Черга: {queue}" if queue else "Фільтр за чергою вимкнено"
+            if was_linked:
+                toast += ". Автооновлення з кабінету вимкнено"
         await cb.message.edit_reply_markup(reply_markup=sub_keyboard(sub))
         await cb.answer(toast)
 
@@ -850,6 +1260,8 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
         return (f"Чатів: {s['targets']}\nПідписок: {s['subscriptions']}\nУнікальних адрес: {s['addresses']}\n"
                 f"Чатів із графіком: {len(db.graph_targets())}\n"
                 f"Адрес із фільтром за чергою: {s['with_queue']}\n"
+                + (f"Адрес із чергою з кабінету: {s['with_cabinet']} (акаунтів: {s['cabinet_accounts']})\n"
+                   if cabinet is not None else "") +
                 f"Останній цикл: {last} ({monitor.last_poll_summary})\n"
                 f"Інтервал: {settings.poll_interval} с")
 
@@ -903,7 +1315,7 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
                 last = key
             flags = ("" if sub.events else " 🔕відкл.") + (" 🖼графік" if sub.graphs else "") + \
                     ("" if sub.silent else " 🔔зі звуком") + (" 🔒" if sub.source == "config" else "")
-            queue = f" · черга {sub.queue}" if sub.queue else ""
+            queue = (f" · черга {sub.queue}" + (" 🔐" if sub.queue_from_cabinet else "")) if sub.queue else ""
             lines.append(f"• {escape(sub.label)}{queue} <code>({sub.street_id}, {escape(sub.house)})</code>{flags}")
         nav = []
         if page > 0:
