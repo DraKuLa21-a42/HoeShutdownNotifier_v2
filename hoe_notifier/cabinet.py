@@ -4,8 +4,8 @@ API (з'ясовано за запитами браузера):
   POST /Token  {"username", "password", "rememberme"}  → {"accessToken", "tokenType": "bearer", "expiresIn"}
   GET  /api/household-consumers/cabinet/get-by-user               → договори користувача (cabinetId)
   GET  /api/household-consumers/technical-data/get-oms-data/{id}  → {"shutdowns": [...], "shutdownQueues": [...]}
-Решта запитів іде з `Authorization: Bearer <token>`. Токен живе добу, тому пароль зберігається (зашифрованим),
-щоб сервіс міг сам перелогінитися.
+Решта запитів іде з `Authorization: Bearer <token>`. Токен живе добу, тому пароль зберігається (зашифрованим
+ключем SECRET_KEY, див. crypto.py), щоб сервіс міг сам перелогінитися.
 """
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 
 import httpx
 
+from .crypto import DecryptError, SecretBox
 from .db import CABINET_AUTH_FAILED, CabinetAccount, Database
 
 log = logging.getLogger(__name__)
@@ -70,34 +71,6 @@ class QueueEntry:
 class OmsData:
     queues: list[QueueEntry]
     shutdowns: list = field(default_factory=list)
-
-
-# --- шифрування ----------------------------------------------------------
-
-class SecretBox:
-    """Шифрування паролів і токенів ключем Fernet із CABINET_SECRET_KEY."""
-
-    def __init__(self, key: str) -> None:
-        from cryptography.fernet import Fernet
-        self._fernet = Fernet(key.encode() if isinstance(key, str) else key)
-
-    def encrypt(self, value: str) -> str:
-        return self._fernet.encrypt(value.encode("utf-8")).decode("ascii")
-
-    def decrypt(self, value: str) -> str:
-        from cryptography.fernet import InvalidToken
-        try:
-            return self._fernet.decrypt(value.encode("ascii")).decode("utf-8")
-        except (InvalidToken, ValueError) as exc:
-            raise CabinetAuthError("Не вдалося розшифрувати збережені дані (змінився CABINET_SECRET_KEY?)") from exc
-
-
-def validate_key(key: str) -> None:
-    """ValueError, якщо рядок не є ключем Fernet."""
-    try:
-        SecretBox(key)
-    except Exception as exc:
-        raise ValueError(str(exc)) from exc
 
 
 # --- HTTP-клієнт ---------------------------------------------------------
@@ -263,10 +236,13 @@ class CabinetService:
         if not fresh and current.token_enc and (current.token_exp or 0) > time.time() + TOKEN_MARGIN:
             try:
                 return self.box.decrypt(current.token_enc)
-            except CabinetAuthError:
+            except DecryptError:
                 pass   # токен не розшифровується — просто увійдемо заново
         try:
-            password = self.box.decrypt(current.password_enc)
+            try:
+                password = self.box.decrypt(current.password_enc)
+            except DecryptError as exc:
+                raise CabinetAuthError(str(exc)) from exc
             token, exp = await self.client.login(current.login, password)
         except CabinetAuthError as exc:
             self.db.set_cabinet_status(acc.id, CABINET_AUTH_FAILED, str(exc))

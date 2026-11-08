@@ -129,6 +129,9 @@ class SlackSink:
             bot = self.db.get_slack_bot(int(bot_id)) if self.db and bot_id.isdigit() else None
             if bot is None:
                 raise TargetGone("Slack-бота видалено")
+            if not bot.token:
+                # Не TargetGone: інакше підписки видалились би через проблему з ключем на сервері.
+                raise RuntimeError(f"токен Slack-бота №{bot.id} не розшифровується (немає або змінився SECRET_KEY)")
             return self._client(bot.token), channel
         if not self.token:
             raise TargetGone("не задано SLACK_TOKEN")
@@ -159,6 +162,9 @@ class SlackSink:
         bot = self.db.get_slack_bot(bot_id)
         if bot is None:
             raise ChannelError("Slack-бота не знайдено.")
+        if not bot.token:
+            raise ChannelError("Токен цього Slack-бота не вдається прочитати на сервері — видали й підключи його "
+                               "заново в /slack.")
         client = self._client(bot.token)
         ref = ref.strip()
         try:

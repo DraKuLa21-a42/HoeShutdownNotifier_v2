@@ -1,11 +1,20 @@
 """SQLite-сховище: підписки на адреси, останній стан, службові значення."""
 from __future__ import annotations
 
+import logging
 import sqlite3
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+from .crypto import DecryptError, fingerprint, looks_encrypted
+
+if TYPE_CHECKING:
+    from .crypto import SecretBox
+
+log = logging.getLogger(__name__)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS subscriptions (
@@ -36,7 +45,8 @@ CREATE TABLE IF NOT EXISTS address_state (
 CREATE TABLE IF NOT EXISTS slack_bots (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     owner_id   INTEGER NOT NULL,                   -- Telegram-користувач, який підключив бота
-    token      TEXT    NOT NULL,                   -- токен бота Slack (xoxb-…)
+    token      TEXT    NOT NULL,                   -- токен бота Slack; зашифрований, якщо задано SECRET_KEY
+    token_hash TEXT,                               -- sha256 токена: пошук дублікатів без розшифрування
     team       TEXT    NOT NULL DEFAULT '',        -- назва воркспейсу
     bot_name   TEXT    NOT NULL DEFAULT '',
     created_at INTEGER NOT NULL,
@@ -46,7 +56,7 @@ CREATE TABLE IF NOT EXISTS cabinet_accounts (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     owner_id     INTEGER NOT NULL,                 -- Telegram-користувач
     login        TEXT    NOT NULL,
-    password     TEXT    NOT NULL,                 -- зашифровано (Fernet, CABINET_SECRET_KEY)
+    password     TEXT    NOT NULL,                 -- зашифровано (Fernet, SECRET_KEY)
     token        TEXT,                             -- зашифровано
     token_exp    INTEGER,
     status       TEXT    NOT NULL DEFAULT 'ok',    -- ok | auth_failed
@@ -106,13 +116,13 @@ class CabinetAccount:
 class SlackBot:
     id: int
     owner_id: int
-    token: str
+    token: str = field(repr=False)   # уже розшифрований; "" — не вдалося розшифрувати
     team: str
     bot_name: str
 
     @property
     def masked(self) -> str:
-        return f"xoxb-…{self.token[-4:]}"
+        return f"xoxb-…{self.token[-4:]}" if self.token else "xoxb-… (не розшифровується)"
 
 
 @dataclass(frozen=True)
@@ -132,9 +142,6 @@ class AddressState:
     updated_at: int
 
 
-def _slack_bot(row: sqlite3.Row) -> SlackBot:
-    return SlackBot(id=row["id"], owner_id=row["owner_id"], token=row["token"],
-                    team=row["team"], bot_name=row["bot_name"])
 
 
 def _sub(row: sqlite3.Row) -> Subscription:
@@ -156,7 +163,9 @@ def _cabinet(row: sqlite3.Row) -> CabinetAccount:
 
 
 class Database:
-    def __init__(self, path: Path | str) -> None:
+    def __init__(self, path: Path | str, box: SecretBox | None = None) -> None:
+        """`box` — шифрування токенів Slack-ботів (SECRET_KEY); без нього токени зберігаються як є."""
+        self._box = box
         if str(path) != ":memory:":
             Path(path).parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
@@ -165,6 +174,7 @@ class Database:
         with self._lock:
             self._conn.executescript(SCHEMA)
             self._migrate()
+            self._secure_slack_tokens()
             self._conn.commit()
 
     def _migrate(self) -> None:
@@ -176,6 +186,41 @@ class Database:
             self._conn.execute("ALTER TABLE subscriptions ADD COLUMN cabinet_account_id INTEGER")
         if "cabinet_id" not in cols:
             self._conn.execute("ALTER TABLE subscriptions ADD COLUMN cabinet_id INTEGER")
+        slack_cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(slack_bots)")}
+        if "token_hash" not in slack_cols:
+            self._conn.execute("ALTER TABLE slack_bots ADD COLUMN token_hash TEXT")
+
+    def _secure_slack_tokens(self) -> None:
+        """Відкриті токени (зі старіших версій або збережені без ключа): заповнює відбиток і, якщо є ключ, шифрує."""
+        rows = self._conn.execute("SELECT id, token, token_hash FROM slack_bots").fetchall()
+        encrypted = 0
+        for r in rows:
+            if looks_encrypted(r["token"]):
+                continue
+            stored = self._box.encrypt(r["token"]) if self._box else r["token"]
+            self._conn.execute("UPDATE slack_bots SET token=?, token_hash=? WHERE id=?",
+                               (stored, r["token_hash"] or fingerprint(r["token"]), r["id"]))
+            encrypted += bool(self._box)
+        if encrypted:
+            log.info("Зашифровано токенів Slack-ботів: %d", encrypted)
+
+    def plaintext_slack_tokens(self) -> int:
+        """Скільки токенів Slack лежить у базі відкритим текстом (для попередження при запуску)."""
+        with self._lock:
+            rows = self._conn.execute("SELECT token FROM slack_bots").fetchall()
+        return sum(not looks_encrypted(r["token"]) for r in rows)
+
+    def _slack_bot(self, row: sqlite3.Row) -> SlackBot:
+        token = row["token"]
+        if looks_encrypted(token):
+            try:
+                token = self._box.decrypt(token) if self._box else ""
+            except DecryptError:
+                token = ""
+            if not token:
+                log.error("Slack-бот №%s: токен не розшифровується (немає або змінився SECRET_KEY)", row["id"])
+        return SlackBot(id=row["id"], owner_id=row["owner_id"], token=token,
+                        team=row["team"], bot_name=row["bot_name"])
 
     def close(self) -> None:
         with self._lock:
@@ -220,24 +265,29 @@ class Database:
 
     # --- Slack-боти користувачів ------------------------------------------
     def add_slack_bot(self, owner_id: int, token: str, team: str, bot_name: str) -> tuple[SlackBot, bool]:
+        digest = fingerprint(token)
         with self._lock:
-            cur = self._conn.execute(
-                "INSERT OR IGNORE INTO slack_bots (owner_id,token,team,bot_name,created_at) VALUES (?,?,?,?,?)",
-                (owner_id, token, team, bot_name, int(time.time())))
-            self._conn.commit()
             row = self._conn.execute(
-                "SELECT * FROM slack_bots WHERE owner_id=? AND token=?", (owner_id, token)).fetchone()
-        return _slack_bot(row), cur.rowcount > 0
+                "SELECT * FROM slack_bots WHERE owner_id=? AND token_hash=?", (owner_id, digest)).fetchone()
+            if row:
+                return self._slack_bot(row), False
+            stored = self._box.encrypt(token) if self._box else token
+            cur = self._conn.execute(
+                "INSERT INTO slack_bots (owner_id,token,token_hash,team,bot_name,created_at) VALUES (?,?,?,?,?,?)",
+                (owner_id, stored, digest, team, bot_name, int(time.time())))
+            self._conn.commit()
+            row = self._conn.execute("SELECT * FROM slack_bots WHERE id=?", (cur.lastrowid,)).fetchone()
+        return self._slack_bot(row), True
 
     def get_slack_bot(self, bot_id: int) -> SlackBot | None:
         with self._lock:
             row = self._conn.execute("SELECT * FROM slack_bots WHERE id=?", (bot_id,)).fetchone()
-        return _slack_bot(row) if row else None
+        return self._slack_bot(row) if row else None
 
     def list_slack_bots(self, owner_id: int) -> list[SlackBot]:
         with self._lock:
             rows = self._conn.execute("SELECT * FROM slack_bots WHERE owner_id=? ORDER BY id", (owner_id,)).fetchall()
-        return [_slack_bot(r) for r in rows]
+        return [self._slack_bot(r) for r in rows]
 
     def stats_for_slack_bot(self, bot_id: int) -> int:
         with self._lock:

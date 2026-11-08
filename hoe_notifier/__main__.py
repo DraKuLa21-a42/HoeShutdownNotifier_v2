@@ -54,7 +54,14 @@ async def run() -> int:
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
-    db = Database(settings.db_path)
+    box = None
+    if settings.secret_key:
+        from .crypto import SecretBox
+        box = SecretBox(settings.secret_key)
+    db = Database(settings.db_path, box=box)
+    if box is None and db.plaintext_slack_tokens():
+        log.warning("Токени Slack-ботів зберігаються в базі відкритим текстом: задайте SECRET_KEY у .env, "
+                    "і при наступному запуску їх буде зашифровано")
     hoe = HoeClient(
         settings.hoe_base_url, timeout=settings.request_timeout, retries=settings.retries,
         retry_delay=settings.retry_delay,
@@ -92,12 +99,12 @@ async def run() -> int:
 
     cabinet = None
     if settings.cabinet_enabled:
-        from .cabinet import CabinetClient, CabinetService, SecretBox
+        from .cabinet import CabinetClient, CabinetService
 
         cabinet = CabinetService(
             db, CabinetClient(settings.cabinet_base_url, timeout=settings.request_timeout,
                               retries=settings.retries, retry_delay=settings.retry_delay),
-            SecretBox(settings.cabinet_key))
+            box)
         log.info("Особистий кабінет: увімкнено, оновлення черг кожні %d с", settings.cabinet_sync_interval)
 
     monitor = Monitor(db, hoe, sinks, poll_interval=settings.poll_interval,
