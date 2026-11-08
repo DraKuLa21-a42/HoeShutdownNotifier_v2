@@ -30,8 +30,7 @@ log = logging.getLogger(__name__)
 
 HELP = (
     "<b>Сповіщення про погодинні відключення (Хмельницькобленерго)</b>\n\n"
-    "/add — додати адресу: населений пункт → вулиця → будинок\n"
-    "/add_id <code>&lt;streetId&gt; &lt;будинок&gt; [назва]</code> — додати адресу за ID вулиці\n"
+    "/add — додати адресу: населений пункт → вулиця → будинок (можна одразу: <code>/add Давидківці</code>)\n"
     "/slack — підключити власного Slack-бота / керувати ними\n"
     "/list — мої адреси та налаштування (сповіщення, графік, звук, черга)\n"
     "/check — перевірити всі мої адреси зараз\n"
@@ -42,17 +41,17 @@ HELP = (
     "/cancel — скасувати поточну дію\n\n"
     "<b>Фільтр за чергою.</b> У /list натисни «🔢 Черга» біля адреси й обери свою підчергу (1.1 – 6.2): "
     "бот надсилатиме лише відключення твоєї черги (і текстовий графік лише з нею). "
-    "Одразу під час додавання: <code>/add_id 123456 12 Дім --queue=1.1</code>.\n\n"
+    "Одразу під час додавання: <code>/add --queue=1.1</code>.\n\n"
     "<b>Сповіщення в канал або групу.</b> Додай бота в канал адміністратором з правом "
     "«Публікація повідомлень» і дописуй до команди <code>--to=&lt;ID каналу або @username&gt;</code>:\n"
-    "<code>/add_id 123456 12 Дім --to=-1001234567890</code>\n"
+    "<code>/add --to=-1001234567890</code>\n"
     "<code>/add --to=@my_channel</code>\n"
     "Команди надсилай мені в приватні повідомлення; керувати такими адресами можна з /list.\n"
     "У груповому чаті керувати адресами можуть лише адміністратори групи.\n\n"
     "<b>Slack.</b> Підключи свого Slack-бота командою /slack (токен, інструкція всередині), запроси його в канал "
     "(<code>/invite @назва_бота</code>) і дописуй <code>--slack=&lt;ID каналу або #назва&gt;</code>:\n"
-    "<code>/add_id 123456 12 Дім --slack=C0123ABCD</code>\n"
-    "<code>/add --slack=#svitlo</code>"
+    "<code>/add --slack=C0123ABCD</code>\n"
+    "<code>/add Давидківці --slack=#svitlo --queue=1.1</code>"
 )
 
 # На мобільних "--" часто автозамінюється на тире, тому приймаємо і його.
@@ -401,7 +400,7 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
             return
         rest, raw_to = split_to(command.args)
         rest, raw_slack = split_slack(rest)
-        _, raw_queue = split_queue(rest)
+        rest, raw_queue = split_queue(rest)
         queue, ok = await parse_queue_option(message, raw_queue)
         if not ok:
             return
@@ -413,6 +412,9 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
         await state.update_data(dest=dest.as_list() if dest else None, queue=queue)
         where = (f" (у Slack: {escape(dest.title)})" if dest.channel == "slack" else
                  f" (у «{escape(dest.title)}»)") if dest else ""
+        if len(rest.strip()) >= 2:      # /add Давидківці — пропускаємо перше запитання
+            await search_settlements(message, state, rest.strip())
+            return
         markup = prompt_markup(message.chat.type)
         last = last_settlement(message.from_user.id)
         if markup is None and last:  # у приватному чаті пропонуємо швидкий вибір останнього міста
@@ -427,12 +429,10 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
         except SearchUnavailable as exc:
             log.warning("Пошук на сайті не вдався: %s", exc)
             await state.clear()
-            await message.answer("Пошук на сайті зараз недоступний. Спробуй пізніше або скористайся /add_id.")
+            await message.answer("Пошук на сайті зараз недоступний. Спробуй пізніше.")
             return None
 
-    @router.message(StateFilter(AddFlow.settlement_query), F.text, ~F.text.startswith("/"))
-    async def settlement_query(message: Message, state: FSMContext) -> None:
-        query = (message.text or "").strip()
+    async def search_settlements(message: Message, state: FSMContext, query: str) -> None:
         if len(query) < 2:
             await message.answer("Введи хоча б 2 символи.", reply_markup=prompt_markup(message.chat.type))
             return
@@ -447,6 +447,10 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
         await state.update_data(settlements=[[o.id, o.name] for o in found])
         await state.set_state(AddFlow.settlement_pick)
         await message.answer("Обери населений пункт:", reply_markup=options_keyboard("sp", found))
+
+    @router.message(StateFilter(AddFlow.settlement_query), F.text, ~F.text.startswith("/"))
+    async def settlement_query(message: Message, state: FSMContext) -> None:
+        await search_settlements(message, state, (message.text or "").strip())
 
     @router.callback_query(StateFilter(AddFlow.settlement_query, AddFlow.settlement_pick),
                            F.data.regexp(r"^sp:(\d+|last)$"))
@@ -568,7 +572,8 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
         rest, raw_queue = split_queue(rest)
         parts = rest.split(maxsplit=2)
         if len(parts) < 2:
-            await message.answer("Формат: <code>/add_id &lt;streetId&gt; &lt;будинок&gt; [назва] "
+            await message.answer("Команда для досвідчених. Зазвичай просто використовуй /add.\n"
+                                 "Формат: <code>/add_id &lt;streetId&gt; &lt;будинок&gt; [назва] "
                                  "[--queue=1.1] [--to=&lt;ID каналу або @username&gt; | "
                                  "--slack=&lt;ID каналу або #назва&gt;]</code>")
             return
@@ -624,7 +629,7 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
         await message.answer(
             f"✅ {'Підключено' if created else 'Цей бот уже підключено'}: <b>{escape(team)}</b>, "
             f"бот {escape(bot_name)} (№{bot.id}).\n\nЗапроси його в канал: <code>/invite @{escape(bot_name)}</code>, "
-            "а потім додай адресу:\n<code>/add_id 123456 12 Дім --slack=C0123ABCD</code>")
+            "а потім додай адресу:\n<code>/add --slack=C0123ABCD</code>")
         return True
 
     @router.message(Command("slack"))

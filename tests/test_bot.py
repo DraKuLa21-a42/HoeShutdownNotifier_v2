@@ -245,7 +245,7 @@ async def test_search_unavailable_ends_dialog_with_hint(env):
     hoe.broken = True
     await send(msg("/add"))
     await send(msg("давид"))
-    assert "add_id" in session.texts()[-1]
+    assert "недоступний" in session.texts()[-1] and "add_id" not in session.texts()[-1]
     await send(msg("ще раз"))                    # діалог завершено — текст ігнорується
     assert db.stats()["subscriptions"] == 0
 
@@ -745,3 +745,22 @@ async def test_stats_command_still_works(env):
     db, hoe, session, send, msg, cb = env
     await send(msg("/stats"))
     assert "Унікальних адрес" in session.texts()[-1]
+
+
+async def test_add_with_settlement_argument_skips_first_question(env):
+    db, hoe, session, send, msg, cb = env
+    await send(msg("/add давид --queue=2.1"))
+    assert "Обери населений пункт" in session.texts()[-1]       # одразу результати пошуку
+    await send(cb("sp:0"))
+    await send(msg("проскур"))
+    await send(cb("st:0"))
+    await send(msg("12А"))
+    sub = db.list_subscriptions("tg", "1")[0]
+    assert sub.queue == "2.1" and sub.street_id == "77" and sub.house == "12А"
+
+
+async def test_help_does_not_require_street_id(env):
+    db, hoe, session, send, msg, cb = env
+    await send(msg("/help"))
+    text = session.texts()[-1]
+    assert "add_id" not in text and "streetId" not in text and "/add" in text
