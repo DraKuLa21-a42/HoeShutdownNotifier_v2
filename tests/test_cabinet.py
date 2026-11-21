@@ -213,8 +213,75 @@ async def test_sync_applies_new_queue_and_notifies():
     assert report.changed == [(sub.label, "2.2", "3.1")]
     updated = db.get_subscription(sub.id)
     assert updated.queue == "3.1" and updated.queue_from_cabinet       # прив'язка лишається
-    target, subject, label, body = sink.texts[-1]
-    assert target == "1" and subject == SUBJECT_QUEUE_CHANGED and "3.1" in body and "була 2.2" in body
+    (t1, head, label1, body1), (t2, subject2, label2, body2) = sink.texts[-2:]
+    assert t1 == t2 == "1"
+    assert head == "🔄 Черга 3.1 (була 2.2)"                       # черга — на початку, видно в закріпленому
+    assert label1 == sub.label and SUBJECT_QUEUE_CHANGED in body1 and "кабінету" in body1
+    assert subject2 == "Відключення для черги 3.1" and label2.endswith("· черга 3.1")   # окреме повідомлення
+
+
+class PinSink(FakeSink):
+    """Telegram-подібний канал: send_text повертає id повідомлення, є pin/unpin."""
+
+    def __init__(self):
+        super().__init__()
+        self.next_id, self.pinned, self.pin_log, self.pin_error = 100, set(), [], None
+
+    async def send_text(self, target, subject, label, body, *, silent, pre=True):
+        await super().send_text(target, subject, label, body, silent=silent, pre=pre)
+        self.next_id += 1
+        return str(self.next_id)
+
+    async def pin(self, target, message_id):
+        if self.pin_error:
+            raise self.pin_error
+        self.pinned.add((target, message_id))
+        self.pin_log.append(("pin", target, message_id))
+
+    async def unpin(self, target, message_id):
+        self.pinned.discard((target, message_id))
+        self.pin_log.append(("unpin", target, message_id))
+
+
+async def pin_env():
+    db, site, sink, mon, acc, sub = await sync_env()
+    pin = PinSink()
+    mon.sinks["tg"] = pin
+    await mon.sync_cabinet()                          # перша синхронізація: черга та сама, нічого не шлемо
+    return db, site, pin, mon, sub
+
+
+async def test_queue_change_message_is_pinned_and_previous_unpinned():
+    db, site, pin, mon, sub = await pin_env()
+    site.queues[16568][0]["queue"] = "3.1"
+    await mon.sync_cabinet()
+    assert pin.pinned == {("1", "101")}                # закріплено саме повідомлення про зміну черги, не відключення
+    assert pin.texts[0][1].startswith("🔄 Черга 3.1")
+
+    site.queues[16568][0]["queue"] = "4.1"
+    await mon.sync_cabinet()
+    assert pin.pinned == {("1", "103")} and pin.texts[2][1] == "🔄 Черга 4.1 (була 3.1)"
+    assert pin.pin_log[-2:] == [("pin", "1", "103"), ("unpin", "1", "101")]   # спершу нове, потім старе
+
+
+async def test_pin_failure_still_delivers_and_unpins_old():
+    db, site, pin, mon, sub = await pin_env()
+    site.queues[16568][0]["queue"] = "3.1"
+    await mon.sync_cabinet()
+    pin.pin_error = RuntimeError("not enough rights to pin a message")
+    site.queues[16568][0]["queue"] = "4.1"
+    await mon.sync_cabinet()
+    assert len(pin.texts) == 4                         # обидва повідомлення доставлено
+    assert pin.pinned == set()                         # застаріла черга не лишилась у закріпленому
+    assert db.kv_get(f"queue_pin:{sub.id}") is None
+
+
+async def test_channel_without_pin_support_gets_messages():
+    db, site, sink, mon, acc, sub = await sync_env()
+    await mon.sync_cabinet()
+    site.queues[16568][0]["queue"] = "3.1"
+    await mon.sync_cabinet()
+    assert len(sink.texts) == 2 and db.kv_get(f"queue_pin:{sub.id}") is None
 
 
 async def test_sync_auth_failure_notifies_owner_once_and_pauses():

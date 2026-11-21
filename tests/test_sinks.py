@@ -7,12 +7,49 @@ from hoe_notifier.sinks import SlackSink, TargetGone, TargetMigrated, TelegramSi
 
 class FakeBot:
     def __init__(self, error=None):
-        self.sent, self.error = [], error
+        self.sent, self.error, self.pins = [], error, []
 
     async def send_message(self, **kwargs):
         if self.error:
             raise self.error
         self.sent.append(kwargs)
+
+        class Msg:
+            message_id = len(self.sent)
+        return Msg()
+
+    async def pin_chat_message(self, **kwargs):
+        self.pins.append(("pin", kwargs))
+
+    async def unpin_chat_message(self, **kwargs):
+        self.pins.append(("unpin", kwargs))
+
+
+async def test_telegram_send_returns_message_id_and_pins():
+    bot = FakeBot()
+    sink = TelegramSink(bot)
+    mid = await sink.send_text("-100", "s", "l", "b", silent=True)
+    assert mid == "1"
+    await sink.pin("-100", mid)
+    await sink.unpin("-100", "7")
+    assert bot.pins == [("pin", {"chat_id": -100, "message_id": 1, "disable_notification": True}),
+                        ("unpin", {"chat_id": -100, "message_id": 7})]
+
+
+async def test_slack_send_returns_ts_and_pins():
+    calls = []
+    sink = SlackSink("xoxb-test")
+
+    async def fake_run(func, **kwargs):
+        calls.append((func.__name__, kwargs))
+        return {"ok": True, "ts": "1700000000.000100"}
+    sink._run = fake_run
+    ts = await sink.send_text("C1", "s", "l", "b", silent=True)
+    await sink.pin("C1", ts)
+    await sink.unpin("C1", "1.2")
+    assert ts == "1700000000.000100"
+    assert calls[1] == ("pins_add", {"channel": "C1", "timestamp": ts})
+    assert calls[2] == ("pins_remove", {"channel": "C1", "timestamp": "1.2"})
 
 
 def test_fit_body_short_text_untouched():

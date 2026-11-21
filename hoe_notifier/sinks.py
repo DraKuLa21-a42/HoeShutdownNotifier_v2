@@ -58,8 +58,12 @@ def render_message(subject: str, label: str, body: str, *, pre: bool = True) -> 
 
 class Sink(Protocol):
     async def send_text(self, target: str, subject: str, label: str, body: str, *, silent: bool,
-                        pre: bool = True) -> None: ...
+                        pre: bool = True) -> str | None:
+        """Надсилає повідомлення; повертає його ідентифікатор (для закріплення), якщо канал його дає."""
     async def send_photo(self, target: str, data: bytes, *, silent: bool) -> None: ...
+    # Необов'язкові: закріпити / відкріпити повідомлення за ідентифікатором із send_text.
+    # async def pin(self, target: str, message_id: str) -> None: ...
+    # async def unpin(self, target: str, message_id: str) -> None: ...
 
 
 class TelegramSink:
@@ -87,11 +91,21 @@ class TelegramSink:
                 raise
 
     async def send_text(self, target, subject, label, body, *, silent, pre=True):
-        await self._call(
+        msg = await self._call(
             self.bot.send_message, chat_id=int(target),
             text=render_message(subject, label, body, pre=pre),
             parse_mode="HTML", disable_notification=silent,
         )
+        message_id = getattr(msg, "message_id", None)
+        return str(message_id) if message_id is not None else None
+
+    async def pin(self, target, message_id):
+        """У групах і каналах бот має бути адміністратором із правом закріплювати повідомлення."""
+        await self._call(self.bot.pin_chat_message, chat_id=int(target), message_id=int(message_id),
+                         disable_notification=True)
+
+    async def unpin(self, target, message_id):
+        await self._call(self.bot.unpin_chat_message, chat_id=int(target), message_id=int(message_id))
 
     async def send_photo(self, target, data, *, silent):
         from aiogram.types import BufferedInputFile
@@ -211,11 +225,24 @@ class SlackSink:
         shown = (f"```{body}```" if pre else body) if body else ""
         text = head + ("\n" if head and shown else "") + shown
         client, channel = self._client_and_channel(target)
-        await self._run(
+        resp = await self._run(
             client.chat_postMessage, channel=channel,
             text=(f"{subject} {label}".strip() or body[:100]),
             blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": text}}],
         )
+        try:
+            return resp.get("ts")
+        except AttributeError:
+            return None
+
+    async def pin(self, target, message_id):
+        """Потрібне право pins:write; без нього Slack поверне missing_scope (повідомлення просто не закріпиться)."""
+        client, channel = self._client_and_channel(target)
+        await self._run(client.pins_add, channel=channel, timestamp=message_id)
+
+    async def unpin(self, target, message_id):
+        client, channel = self._client_and_channel(target)
+        await self._run(client.pins_remove, channel=channel, timestamp=message_id)
 
     async def send_photo(self, target, data, *, silent):
         client, channel = self._client_and_channel(target)

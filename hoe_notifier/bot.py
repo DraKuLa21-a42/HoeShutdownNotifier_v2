@@ -129,7 +129,7 @@ SLACK_TOKEN_RE = re.compile(r"xoxb-[A-Za-z0-9-]{10,}")
 SLACK_GUIDE = (
     "<b>Як підключити Slack</b>\n"
     "1. Відкрий api.slack.com/apps → <b>Create New App</b> → From scratch, обери воркспейс.\n"
-    "2. <b>OAuth &amp; Permissions</b> → Bot Token Scopes: <code>chat:write</code>, <code>files:write</code>; "
+    "2. <b>OAuth &amp; Permissions</b> → Bot Token Scopes: <code>chat:write</code>, <code>files:write</code> (і <code>pins:write</code>, щоб закріплювати зміну черги); "
     "щоб шукати канали за #назвою — ще <code>channels:read</code>, <code>groups:read</code>.\n"
     "3. <b>Install to Workspace</b> і скопіюй <b>Bot User OAuth Token</b> (починається з <code>xoxb-</code>).\n"
     "4. Надішли токен сюди одним повідомленням — я одразу видалю його з чату й збережу.\n\n"

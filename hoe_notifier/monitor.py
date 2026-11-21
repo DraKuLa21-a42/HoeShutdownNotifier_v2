@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import json
 import logging
 import random
 import time
@@ -27,7 +28,8 @@ FAILURE_ALERT_AFTER = 3  # поспіль невдалих циклів, пер�
 FAIL_FAST_AFTER = 3      # скільки адрес поспіль мають не відповісти, щоб перервати цикл
 TEXT_GRAPH_SUBJECT = "Графік погодинних відключень"
 MANUAL_REFRESH_MAX_AGE = 60  # /check та додавання адреси не б'ють у сайт частіше, ніж раз на стільки секунд
-SUBJECT_QUEUE_CHANGED = "Змінилась черга відключень"
+SUBJECT_QUEUE_CHANGED = "Змінилась черга відключень"   # текст повідомлення про зміну черги (заголовок — сама черга)
+QUEUE_PIN_KEY = "queue_pin:{}"   # kv: закріплене повідомлення про зміну черги для підписки (JSON: target, message)
 SUBJECT_CABINET_AUTH = "Особистий кабінет: не вдалося увійти"
 
 
@@ -149,14 +151,19 @@ class Monitor:
 
         Недоступного адресата відписуємо, перенесеному (group→supergroup) — переносимо підписки.
         """
+        ok, _, _ = await self._deliver(sub, method, *args, **kwargs)
+        return ok
+
+    async def _deliver(self, sub, method: str, *args, **kwargs):
+        """Як `_send`, але повертає (доставлено, результат методу каналу, адресат після можливого перенесення)."""
         sink = self.sinks.get(sub.channel)
         if sink is None:
             log.warning("Немає каналу доставки %r для %s", sub.channel, sub.target)
-            return False
+            return False, None, sub
         for _ in range(2):
             try:
-                await getattr(sink, method)(sub.target, *args, **kwargs)
-                return True
+                result = await getattr(sink, method)(sub.target, *args, **kwargs)
+                return True, result, sub
             except TargetMigrated as moved:
                 log.warning("Чат %s перенесено на %s — оновлюю підписки", sub.target, moved.new_target)
                 self.db.move_target(sub.channel, sub.target, moved.new_target)
@@ -165,11 +172,11 @@ class Monitor:
                 removed = self.db.delete_target(sub.channel, sub.target)
                 log.warning("Адресат %s/%s недоступний, видалено підписок: %d (%s)",
                             sub.channel, sub.target, removed, exc)
-                return False
+                return False, None, sub
             except Exception:
                 log.exception("Не вдалось надіслати повідомлення %s/%s", sub.channel, sub.target)
-                return False
-        return False
+                return False, None, sub
+        return False, None, sub
 
     async def _broadcast_changes(self, subs: list[Subscription], previous: str | None, current: str) -> None:
         """Кожному підписнику — лише те, що стосується його черги, і лише якщо це змінилось.
@@ -306,13 +313,61 @@ class Monitor:
         report.ok += 1
 
     async def _apply_cabinet_queue(self, sub: Subscription, queue: str) -> None:
+        """Два повідомлення: про зміну черги (закріплюється замість попереднього) і відключення для нової черги."""
         old = sub.queue
         sub = self.db.set_queue(sub.id, queue, keep_cabinet=True)
         log.info("Адреса %s: черга з кабінету %s → %s", sub.label, old, queue)
+
+        # Черга — у першому рядку, щоб її було видно в рядку закріпленого повідомлення.
+        head = f"🔄 Черга {queue}" + (f" (була {old})" if old else "")
+        ok, message_id, delivered = await self._deliver(
+            sub, "send_text", head, sub.label, f"{SUBJECT_QUEUE_CHANGED} — за даними особистого кабінету.",
+            silent=sub.silent, pre=False)
+        if ok and message_id:
+            await self._repin(delivered, str(message_id))
+        await asyncio.sleep(self.send_delay)
+
         state = self.db.get_state(sub.street_id, sub.house)
-        body = (f"Нова черга: {queue}" + (f" (була {old})" if old else "") + " — за даними особистого кабінету.\n\n"
-                + describe_state(state, queue))
-        await self._send(sub, "send_text", SUBJECT_QUEUE_CHANGED, label_for(sub), body, silent=sub.silent)
+        if state is None:
+            subject, body = f"Відключення для черги {queue}", "Дані поки не отримано."
+        else:
+            body = outage_view(state.last_text, queue)
+            subject = f"Погодинні відключення для черги {queue}" if body else subject_none(queue)
+        # Без звуку: сповіщення вже прийшло з першим повідомленням.
+        await self._send(delivered, "send_text", subject, label_for(sub), body, silent=True)
+
+    async def _repin(self, sub: Subscription, message_id: str) -> None:
+        """Закріплює нове повідомлення про зміну черги й відкріплює попереднє для цієї ж адреси."""
+        sink = self.sinks.get(sub.channel)
+        if sink is None or not hasattr(sink, "pin"):
+            return
+        key = QUEUE_PIN_KEY.format(sub.id)
+        previous = None
+        raw = self.db.kv_get(key)
+        if raw:
+            try:
+                previous = json.loads(raw)
+            except ValueError:
+                previous = None
+
+        pinned = False
+        try:
+            await sink.pin(sub.target, message_id)
+            pinned = True
+        except Exception as exc:          # немає прав адміна в групі/каналі, немає pins:write у Slack тощо
+            log.info("Не вдалось закріпити повідомлення в %s/%s: %s", sub.channel, sub.target, exc)
+
+        # Старе відкріплюємо навіть якщо нове не закріпилось — застаріла черга в закріпленому гірша за порожнечу.
+        if previous and str(previous.get("message")) != message_id:
+            try:
+                await sink.unpin(str(previous.get("target", sub.target)), str(previous["message"]))
+            except Exception as exc:      # повідомлення видалили / відкріпили вручну
+                log.info("Не вдалось відкріпити попереднє повідомлення в %s/%s: %s", sub.channel, sub.target, exc)
+
+        if pinned:
+            self.db.kv_set(key, json.dumps({"target": sub.target, "message": message_id}))
+        else:
+            self.db.kv_delete(key)
 
     async def _notify_owner(self, owner_id: int, subject: str, body: str) -> None:
         sink = self.sinks.get("tg")
