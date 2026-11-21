@@ -177,3 +177,52 @@ def test_text_schedule_br_is_the_only_line_break():
 def test_text_schedule_double_br_still_separates_groups_after_wrapping():
     html = "<div class='post'><p>Заголовок черг:<br>\n<br>\nПідчерга 1.1 – 00:00-04:00.<br>\n<br>\nПідчерга 2.1 – 04:00-08:00.</p></div>"
     assert parse_text_schedule(html) == "Заголовок черг:\n\nПідчерга 1.1 – 00:00-04:00.\n\nПідчерга 2.1 – 04:00-08:00."
+
+# ------------------------------------- графік кількома абзацами <p> (формат сайту з 21.11.2026)
+MULTI_P_PAGE = (
+    "<div class='post'>"
+    "<p>За розпорядженням НЕК «Укренерго» оновлено графік погодинних відключень (ГПВ) на 21 листопада (оновлено 23:00).</p>\n"
+    "<p>Години відсутності електроенергії:</p>\n"
+    "<p>Підчерга 1.1 – 00:00-02:00; 06:00-10:00.<br>\nПідчерга 1.2 – 06:00-10:00; 16:00-20:00.</p>\n"
+    "<p>&nbsp;</p>\n"
+    "<p>Підчерга 2.1 – 02:00-06:00.<br>Підчерга 2.2 – 06:00-10:00.</p>\n"
+    "<p>Підчерга 3.1 – 00:00-02:00.<br>Підчерга 3.2 – 02:00-06:00.</p>\n"
+    "<p>Підчерга 4.1 – 02:00-06:00.<br>Підчерга 4.2 – 02:00-06:00.</p>\n"
+    "<p>Підчерга 5.1 – 00:00-02:00.<br>Підчерга 5.2 – 00:00-02:00.</p>\n"
+    "<p>Підчерга 6.1 – 02:00-06:00.<br>Підчерга 6.2 – 00:00-02:00; 06:00-10:00; 13:00-16:00.</p>\n"
+    "<p>21.11.2026 р.</p>\n"
+    "<p>За розпорядженням НЕК «Укренерго» графік погодинних відключень (ГПВ) на 21 листопада.</p>\n"
+    "<p>Години відсутності електроенергії:</p>\n"
+    "<p>Підчерга 1.1 – 00:00-04:00.<br>Підчерга 1.2 – 04:00-08:00.</p>\n"
+    "<hr><p>Перевірити чергу</p></div>"
+)
+
+
+def test_text_schedule_split_into_paragraphs_keeps_all_queues():
+    text = parse_text_schedule(MULTI_P_PAGE)
+    lines = text.splitlines()
+    assert lines[0].startswith("За розпорядженням НЕК «Укренерго» оновлено графік") and lines[0].endswith("(оновлено 23:00).")
+    assert "Години відсутності електроенергії:" in lines
+    assert sum(l.startswith("Підчерга") for l in lines) == 12
+    assert lines[-1] == "Підчерга 6.2 – 00:00-02:00; 06:00-10:00; 13:00-16:00."
+    groups = text.split("\n\n")
+    assert len(groups) == 8                                   # 2 заголовки + 6 груп черг
+    assert "\n\n\n" not in text
+
+
+def test_text_schedule_split_into_paragraphs_takes_only_first_schedule():
+    text = parse_text_schedule(MULTI_P_PAGE)
+    assert "21.11.2026 р." not in text and "00:00-04:00" not in text and "Перевірити чергу" not in text
+
+
+def test_text_schedule_split_into_paragraphs_filters_by_queue():
+    from hoe_notifier.queues import filter_schedule
+    out = filter_schedule(parse_text_schedule(MULTI_P_PAGE), ["3.2"])
+    assert out.startswith("За розпорядженням") and "Години відсутності" in out
+    assert "Підчерга 3.2 – 02:00-06:00." in out and "Підчерга 3.1" not in out and "Підчерга 1.1" not in out
+
+
+def test_text_schedule_paragraphs_do_not_cross_hr():
+    html = ("<div class='post'><p>Підчерга 1.1 – 00:00-04:00.</p><hr>"
+            "<p>Підчерга 2.1 – 04:00-08:00.</p></div>")
+    assert parse_text_schedule(html) == "Підчерга 1.1 – 00:00-04:00."

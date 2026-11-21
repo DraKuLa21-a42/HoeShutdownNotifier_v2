@@ -110,22 +110,74 @@ def normalize_blocks(text: str) -> str:
     return "\n".join(out)
 
 
-def parse_text_schedule(html: str) -> str | None:
-    """Текстовий графік (ГПВ) зі сторінки: абзац, де є назви черг і інтервали часу (`00:00-04:00`).
+# Рядок графіка: «Підчерга 1.1 – …» / «Черга 2: …».
+_QUEUE_LINE = re.compile(r"^\s*(?:під)?черга\s+\d", re.IGNORECASE)
+# Абзац-заголовок перед графіком: «За розпорядженням … графік … (ГПВ) на 21 листопада», «Години відсутності електроенергії:».
+_HEADER_HINT = re.compile(r"розпорядж|графік|гпв|відсутност|відключен", re.IGNORECASE)
+_MAX_HEADER_PARAGRAPHS = 3
 
-    На сайті це `<p>` у `div.post`, рядки розділені `<br>`, а групи черг — подвійним `<br>`.
+
+def _paragraph_text(p) -> str:
+    # Переноси рядків і відступи у вихідному HTML — це звичайні пробіли; розрив рядка дає лише <br>.
+    inner = _BR.sub("\n", re.sub(r"\s+", " ", p.decode_contents()))
+    return normalize_blocks(BeautifulSoup(inner, "html.parser").get_text())
+
+
+def _is_schedule_paragraph(text: str) -> bool:
+    return any(_TIME_RANGE.search(line) for line in text.splitlines()) and "черг" in text.casefold()
+
+
+def _is_header_paragraph(text: str) -> bool:
+    return (bool(text) and not _TIME_RANGE.search(text) and not any(_QUEUE_LINE.match(l) for l in text.splitlines())
+            and bool(_HEADER_HINT.search(text)))
+
+
+def parse_text_schedule(html: str) -> str | None:
+    """Текстовий графік (ГПВ) зі сторінки: заголовок і рядки черг з інтервалами часу (`00:00-04:00`).
+
+    Сайт публікує графік у двох виглядах:
+      * один `<p>` у `div.post`, рядки розділені `<br>`, групи черг — подвійним `<br>`;
+      * кілька `<p>` поспіль: заголовок, «Години відсутності електроенергії:», далі по абзацу на групу черг.
+    Беремо перший такий графік: суміжні абзаци з чергами плюс абзаци-заголовки безпосередньо перед ними.
+    Абзаци у результаті розділяються порожнім рядком, як і групи всередині одного абзацу.
     Розпізнаємо за змістом, а не за точним формулюванням, бо текст щодня трохи інший.
     Результат не залежить від того, як перенесено рядки у вихідному коді сторінки.
     """
     soup = BeautifulSoup(html, "html.parser")
-    for p in (soup.select_one("div.post") or soup).find_all("p"):
-        # Переноси рядків і відступи у вихідному HTML — це звичайні пробіли; розрив рядка дає лише <br>.
-        inner = _BR.sub("\n", re.sub(r"\s+", " ", p.decode_contents()))
-        text = normalize_blocks(BeautifulSoup(inner, "html.parser").get_text())
-        has_times = any(_TIME_RANGE.search(line) for line in text.splitlines())
-        if has_times and "черг" in text.casefold():
-            return text
-    return None
+    root = soup.select_one("div.post") or soup
+    # <hr> — межа розділу сторінки: графік через неї не продовжується. None позначає таку межу.
+    items: list[str | None] = [None if el.name == "hr" else _paragraph_text(el) for el in root.find_all(["p", "hr"])]
+
+    start = next((i for i, t in enumerate(items) if t is not None and _is_schedule_paragraph(t)), None)
+    if start is None:
+        return None
+
+    # Вперед: наступні абзаци з чергами (порожні абзаци між ними пропускаємо).
+    end = start
+    j = start + 1
+    while j < len(items) and items[j] is not None:
+        if items[j] == "":
+            j += 1
+            continue
+        if not _is_schedule_paragraph(items[j]):
+            break
+        end = j
+        j += 1
+
+    # Назад: заголовки безпосередньо перед графіком.
+    first = start
+    k = start - 1
+    while k >= 0 and start - k <= _MAX_HEADER_PARAGRAPHS and items[k] is not None:
+        if items[k] == "":
+            k -= 1
+            continue
+        if not _is_header_paragraph(items[k]):
+            break
+        first = k
+        k -= 1
+
+    parts = [t for t in items[first:end + 1] if t]
+    return "\n\n".join(parts)
 
 
 def parse_image_url(html: str, base_url: str) -> str | None:
