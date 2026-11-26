@@ -25,7 +25,8 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     house      TEXT    NOT NULL,
     label      TEXT    NOT NULL,
     events     INTEGER NOT NULL DEFAULT 1,         -- слати погодинні відключення
-    graphs     INTEGER NOT NULL DEFAULT 0,         -- слати картинку з графіком
+    graphs     INTEGER NOT NULL DEFAULT 0,         -- слати текстовий графік
+    graph_images INTEGER NOT NULL DEFAULT 0,       -- слати графік-картинку
     silent     INTEGER NOT NULL DEFAULT 1,         -- без звуку (лише Telegram)
     queue      TEXT,                               -- підчерга ГПВ (1.1 … 6.2); NULL — усі черги
     source     TEXT    NOT NULL DEFAULT 'bot',     -- bot | config
@@ -68,7 +69,7 @@ CREATE TABLE IF NOT EXISTS cabinet_accounts (
 CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 """
 
-TOGGLE_FIELDS = {"events", "graphs", "silent"}
+TOGGLE_FIELDS = {"events", "graphs", "graph_images", "silent"}
 CABINET_OK = "ok"
 CABINET_AUTH_FAILED = "auth_failed"
 
@@ -89,6 +90,7 @@ class Subscription:
     queue: str | None = None
     cabinet_account_id: int | None = None
     cabinet_id: int | None = None
+    graph_images: bool = False   # `graphs` — текстовий графік, `graph_images` — картинка
 
     @property
     def queue_from_cabinet(self) -> bool:
@@ -151,6 +153,7 @@ def _sub(row: sqlite3.Row) -> Subscription:
         events=bool(row["events"]), graphs=bool(row["graphs"]), silent=bool(row["silent"]),
         source=row["source"], owner_id=row["owner_id"], queue=row["queue"],
         cabinet_account_id=row["cabinet_account_id"], cabinet_id=row["cabinet_id"],
+        graph_images=bool(row["graph_images"]),
     )
 
 
@@ -186,6 +189,10 @@ class Database:
             self._conn.execute("ALTER TABLE subscriptions ADD COLUMN cabinet_account_id INTEGER")
         if "cabinet_id" not in cols:
             self._conn.execute("ALTER TABLE subscriptions ADD COLUMN cabinet_id INTEGER")
+        if "graph_images" not in cols:
+            # Раніше «Графік» вмикав і текст, і картинку — зберігаємо це для наявних підписок.
+            self._conn.execute("ALTER TABLE subscriptions ADD COLUMN graph_images INTEGER NOT NULL DEFAULT 0")
+            self._conn.execute("UPDATE subscriptions SET graph_images = graphs")
         slack_cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(slack_bots)")}
         if "token_hash" not in slack_cols:
             self._conn.execute("ALTER TABLE slack_bots ADD COLUMN token_hash TEXT")
@@ -232,15 +239,20 @@ class Database:
         *, events: bool = True, graphs: bool = False, silent: bool = True,
         source: str = "bot", owner_id: int | None = None, queue: str | None = None,
         cabinet_account_id: int | None = None, cabinet_id: int | None = None,
+        graph_images: bool | None = None,
     ) -> tuple[Subscription, bool]:
+        """`graphs` — текстовий графік; `graph_images` — картинка (None — так само, як `graphs`)."""
+        if graph_images is None:
+            graph_images = graphs
         with self._lock:
             cur = self._conn.execute(
                 "INSERT OR IGNORE INTO subscriptions "
                 "(channel,target,street_id,house,label,events,graphs,silent,source,owner_id,created_at,queue,"
-                "cabinet_account_id,cabinet_id) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "cabinet_account_id,cabinet_id,graph_images) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (channel, str(target), street_id, house, label, int(events), int(graphs),
-                 int(silent), source, owner_id, int(time.time()), queue, cabinet_account_id, cabinet_id),
+                 int(silent), source, owner_id, int(time.time()), queue, cabinet_account_id, cabinet_id,
+                 int(graph_images)),
             )
             self._conn.commit()
             created = cur.rowcount > 0
@@ -490,15 +502,16 @@ class Database:
             ).fetchall()
         return [_sub(r) for r in rows]
 
-    def graph_targets(self) -> list[GraphTarget]:
-        """Чати, які просять графік: по одному запису на (channel, target).
+    def graph_targets(self, *, images: bool = False) -> list[GraphTarget]:
+        """Чати, які просять текстовий графік (або картинку, `images=True`): по одному запису на (channel, target).
 
         Черги — об'єднання черг усіх їхніх адрес із ввімкненим графіком; якщо хоч одна адреса без черги,
         фільтра немає (чат отримує графік повністю).
         """
+        column = "graph_images" if images else "graphs"
         with self._lock:
             rows = self._conn.execute(
-                "SELECT channel, target, silent, queue FROM subscriptions WHERE graphs=1 ORDER BY id"
+                f"SELECT channel, target, silent, queue FROM subscriptions WHERE {column}=1 ORDER BY id"
             ).fetchall()
         grouped: dict[tuple[str, str], list[sqlite3.Row]] = {}
         for r in rows:
@@ -528,13 +541,16 @@ class Database:
             with self._lock:
                 self._conn.execute(
                     "INSERT INTO subscriptions "
-                    "(channel,target,street_id,house,label,events,graphs,silent,source,created_at,queue) "
-                    "VALUES (?,?,?,?,?,?,?,?, 'config', ?, ?) "
+                    "(channel,target,street_id,house,label,events,graphs,silent,source,created_at,queue,"
+                    "graph_images) "
+                    "VALUES (?,?,?,?,?,?,?,?, 'config', ?, ?, ?) "
                     "ON CONFLICT(channel,target,street_id,house) DO UPDATE SET "
                     "label=excluded.label, events=excluded.events, graphs=excluded.graphs, "
-                    "silent=excluded.silent, queue=excluded.queue, source='config'",
+                    "graph_images=excluded.graph_images, silent=excluded.silent, queue=excluded.queue, "
+                    "source='config'",
                     (*key[:2], key[2], key[3], e["label"], int(e["events"]), int(e["graphs"]),
-                     int(e["silent"]), int(time.time()), e.get("queue")),
+                     int(e["silent"]), int(time.time()), e.get("queue"),
+                     int(e.get("graph_images", e["graphs"]))),
                 )
                 self._conn.commit()
         with self._lock:

@@ -42,6 +42,8 @@ def load_addresses(path: Path, *, default_silent: bool = True, default_graphs: b
                 "queue": queue,
                 "events": bool(raw.get("events", True)),
                 "graphs": bool(raw.get("graphs", default_graphs)),
+                # картинка: окремий ключ graph_images; без нього — як graphs (сумісність зі старими файлами)
+                "graph_images": bool(raw.get("graph_images", raw.get("graphs", default_graphs))),
                 "silent": bool(raw.get("silent", default_silent)),
             })
         except (KeyError, ValueError) as exc:

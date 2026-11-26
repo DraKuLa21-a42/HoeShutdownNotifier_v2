@@ -173,9 +173,10 @@ def sub_keyboard(sub: Subscription) -> InlineKeyboardMarkup | None:
     if sub.source == "config":
         return None
     on = lambda v: "✅" if v else "⬜"  # noqa: E731
-    row1 = [
-        InlineKeyboardButton(text=f"{on(sub.events)} Відключення", callback_data=f"sub:{sub.id}:events"),
-        InlineKeyboardButton(text=f"{on(sub.graphs)} Графік", callback_data=f"sub:{sub.id}:graphs"),
+    row1 = [InlineKeyboardButton(text=f"{on(sub.events)} Відключення", callback_data=f"sub:{sub.id}:events")]
+    row_graph = [
+        InlineKeyboardButton(text=f"{on(sub.graphs)} Графік: текст", callback_data=f"sub:{sub.id}:graphs"),
+        InlineKeyboardButton(text=f"{on(sub.graph_images)} Графік: картинка", callback_data=f"sub:{sub.id}:gimg"),
     ]
     row2 = [
         InlineKeyboardButton(text=f"{'🔕' if sub.silent else '🔔'} Звук", callback_data=f"sub:{sub.id}:silent"),
@@ -183,7 +184,7 @@ def sub_keyboard(sub: Subscription) -> InlineKeyboardMarkup | None:
     ]
     lock = " 🔐" if sub.queue_from_cabinet else ""
     row3 = [InlineKeyboardButton(text=f"🔢 Черга: {sub.queue or 'усі'}{lock}", callback_data=f"sub:{sub.id}:queue")]
-    return InlineKeyboardMarkup(inline_keyboard=[row1, row2, row3])
+    return InlineKeyboardMarkup(inline_keyboard=[row1, row_graph, row2, row3])
 
 
 def queue_keyboard(sub: Subscription, cabinet: bool = False) -> InlineKeyboardMarkup:
@@ -1184,7 +1185,7 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
             return False
         return True
 
-    @router.callback_query(F.data.regexp(r"^sub:\d+:(events|graphs|silent|queue|del)$"))
+    @router.callback_query(F.data.regexp(r"^sub:\d+:(events|graphs|gimg|silent|queue|del)$"))
     async def sub_action(cb: CallbackQuery) -> None:
         _, sub_id, action = cb.data.split(":")
         sub = db.get_subscription(int(sub_id))
@@ -1196,7 +1197,7 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
         elif action == "queue":
             await cb.message.edit_reply_markup(reply_markup=queue_keyboard(sub, cabinet_on()))
         else:
-            sub = db.toggle(sub.id, action)
+            sub = db.toggle(sub.id, "graph_images" if action == "gimg" else action)
             await cb.message.edit_reply_markup(reply_markup=sub_keyboard(sub))
         await cb.answer()
 
@@ -1578,7 +1579,8 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
         last = (time.strftime("%H:%M:%S %d.%m.%Y", time.localtime(monitor.last_poll_at))
                 if monitor.last_poll_at else "—")
         return (f"Чатів: {s['targets']}\nПідписок: {s['subscriptions']}\nУнікальних адрес: {s['addresses']}\n"
-                f"Чатів із графіком: {len(db.graph_targets())}\n"
+                f"Чатів із графіком: текст — {len(db.graph_targets())}, "
+                f"картинка — {len(db.graph_targets(images=True))}\n"
                 f"Адрес із фільтром за чергою: {s['with_queue']}\n"
                 + (f"Адрес із чергою з кабінету: {s['with_cabinet']} (акаунтів: {s['cabinet_accounts']})\n"
                    if cabinet_on() else "") +
@@ -1599,7 +1601,8 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
         ])
 
     ADMIN_HELP = ("<b>Панель адміністратора</b>\n"
-                  "«Показати» — лише тобі. «Розіслати» — усім чатам, що ввімкнули «Графік» (з підтвердженням); "
+                  "«Показати» — лише тобі. «Розіслати» — чатам, що ввімкнули відповідний графік: «Графік: текст» "
+                  "або «Графік: картинка» (з підтвердженням); "
                   "автоматично графік надсилається сам, щойно змінюється на сайті.\n"
                   "«⚙️ Налаштування» (або /settings) — параметри сервісу без редагування .env, під окремим паролем.")
 
@@ -1635,7 +1638,8 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
                 title = titles.get(sub.target, "")
                 lines.append(f"\n<b>{sub.channel}:{escape(sub.target)}</b>" + (f" — {escape(title)}" if title else ""))
                 last = key
-            flags = ("" if sub.events else " 🔕відкл.") + (" 🖼графік" if sub.graphs else "") + \
+            flags = ("" if sub.events else " 🔕відкл.") + (" 📋графік" if sub.graphs else "") + \
+                    (" 🖼графік" if sub.graph_images else "") + \
                     ("" if sub.silent else " 🔔зі звуком") + (" 🔒" if sub.source == "config" else "")
             queue = (f" · черга {sub.queue}" + (" 🔐" if sub.queue_from_cabinet else "")) if sub.queue else ""
             lines.append(f"• {escape(sub.label)}{queue} <code>({sub.street_id}, {escape(sub.house)})</code>{flags}")
@@ -1704,7 +1708,7 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
                     await cb.answer(f"На сайті зараз немає: {kind}.", show_alert=True)
                 else:
                     preview = ("\n\n" + escape(fit_body(graphs.text, 1200))) if as_text else ""
-                    targets = db.graph_targets()
+                    targets = db.graph_targets(images=not as_text)
                     n = len(targets)
                     if as_text and any(t.queues for t in targets):
                         preview += "\n\n<i>Чатам із вказаною чергою піде лише рядки їхніх черг.</i>"
@@ -1712,20 +1716,22 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
                         InlineKeyboardButton(text="✅ Так, розіслати", callback_data=f"adm:{action}:yes"),
                         InlineKeyboardButton(text="✖ Скасувати", callback_data=f"adm:{action}:no"),
                     ]])
-                    await cb.message.answer(f"Розіслати {kind} <b>{n}</b> чатам, які ввімкнули «Графік»?{preview}",
+                    toggle = "«Графік: текст»" if as_text else "«Графік: картинка»"
+                    await cb.message.answer(f"Розіслати {kind} <b>{n}</b> чатам, які ввімкнули {toggle}?{preview}",
                                             reply_markup=kb)
                     await cb.answer()
             else:  # yes
                 await cb.answer()
                 await cb.message.edit_text("⏳ Розсилаю…")
                 report = await monitor.send_graphs(image=not as_text, text=as_text, force=True)
-                sent = report.text_sent if as_text else report.image_sent
+                sent, total = ((report.text_sent, report.text_targets) if as_text
+                               else (report.image_sent, report.image_targets))
                 if not report.page_ok:
                     result = "❌ Сторінку графіків не вдалося завантажити."
                 elif report.error:
                     result = f"❌ Помилка: {escape(report.error)}."
                 else:
-                    result = f"✅ Надіслано {sent} з {report.targets} чатів."
+                    result = f"✅ Надіслано {sent} з {total} чатів."
                 await cb.message.edit_text(result)
 
     return router

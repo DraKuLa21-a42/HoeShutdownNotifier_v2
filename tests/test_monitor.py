@@ -337,3 +337,23 @@ async def test_text_graph_blocked_chat_is_unsubscribed(env):
     hoe.graph_text = SCHEDULE
     report = await mon.send_graphs(text=True, image=False, force=True)
     assert report.text_sent == 0 and db.list_subscriptions("tg", "1") == []
+
+async def test_text_and_image_graphs_are_separate_subscriptions(env):
+    db, hoe, sink, mon, _ = env
+    db.add_subscription("tg", "1", "10", "5", "A", graphs=True, graph_images=False)   # лише текст
+    db.add_subscription("tg", "2", "10", "5", "A", graphs=False, graph_images=True)   # лише картинка
+    db.add_subscription("tg", "3", "10", "5", "A", graphs=True)                       # обидва
+    hoe.graph_url, hoe.graph_text = "https://x/1.png", SCHEDULE
+    await mon.poll_once()
+    assert sorted(sink.photos) == ["2", "3"]
+    assert sorted(t[0] for t in graph_texts(sink)) == ["1", "3"]
+
+
+async def test_image_and_text_targets_in_report(env):
+    db, hoe, sink, mon, _ = env
+    db.add_subscription("tg", "1", "10", "5", "A", graphs=True, graph_images=False)
+    db.add_subscription("tg", "2", "10", "5", "A", graphs=False, graph_images=True)
+    hoe.graph_url = "https://x/1.png"
+    report = await mon.send_graphs(force=True)
+    assert (report.text_targets, report.image_targets, report.targets) == (1, 1, 2)
+    assert report.image_sent == 1 and sink.photos == ["2"]

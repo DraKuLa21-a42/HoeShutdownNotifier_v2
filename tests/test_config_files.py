@@ -32,7 +32,16 @@ target = "C02"
     assert len(e) == 1
     assert e[0]["street_id"] == "123456" and e[0]["target"] == "-1001553812345"
     assert e[0]["graphs"] is True and e[0]["silent"] is True
+    assert e[0]["graph_images"] is True                     # без graph_images — як graphs
     assert len(load_addresses(f, available_channels={"tg", "slack"})) == 2
+
+
+def test_addresses_file_graph_images_separately(tmp_path):
+    f = tmp_path / "a.toml"
+    f.write_text('[[address]]\nstreet_id = "1"\nhouse = "2"\ntarget = "5"\ngraphs = true\ngraph_images = false\n',
+                 encoding="utf-8")
+    e = load_addresses(f)[0]
+    assert e["graphs"] is True and e["graph_images"] is False
 
 
 def test_missing_file(tmp_path):

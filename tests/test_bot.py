@@ -292,7 +292,11 @@ async def test_list_toggle_and_delete(env):
     sub = db.list_subscriptions("tg", "1")[0]
     await send(msg("/list"))
     await send(cb(f"sub:{sub.id}:graphs"))
-    assert db.get_subscription(sub.id).graphs is True
+    assert db.get_subscription(sub.id).graphs is True and db.get_subscription(sub.id).graph_images is False
+    await send(cb(f"sub:{sub.id}:gimg"))                    # картинка вмикається окремо
+    assert db.get_subscription(sub.id).graph_images is True
+    await send(cb(f"sub:{sub.id}:graphs"))
+    assert db.get_subscription(sub.id).graphs is False and db.get_subscription(sub.id).graph_images is True
     await send(cb(f"sub:{sub.id}:silent"))
     assert db.get_subscription(sub.id).silent is False
     await send(cb(f"sub:{sub.id}:del"))
@@ -735,7 +739,7 @@ async def test_admin_stats_and_poll_buttons(env):
     db, hoe, session, send, msg, cb = env
     db.add_subscription("tg", "7", "10", "5", "A", graphs=True)
     await send(cb("adm:stats"))
-    assert "Чатів із графіком: 1" in session.texts()[-1]
+    assert "Чатів із графіком: текст — 1, картинка — 1" in session.texts()[-1]
     await send(cb("adm:poll"))
     assert "Готово: 1/1 адрес оновлено" in session.texts()[-1]
     assert hoe.calls == 1
@@ -764,3 +768,13 @@ async def test_help_does_not_require_street_id(env):
     await send(msg("/help"))
     text = session.texts()[-1]
     assert "add_id" not in text and "streetId" not in text and "/add" in text
+
+async def test_admin_send_image_only_to_image_subscribers(env):
+    db, hoe, session, send, msg, cb = env
+    db.add_subscription("tg", "7", "10", "5", "A", graphs=True, graph_images=False)   # лише текст
+    db.add_subscription("tg", "8", "10", "5", "A", graphs=False, graph_images=True)   # лише картинка
+    hoe.graph_url = "https://x/1.png"
+    await send(cb("adm:send_img"))
+    assert "<b>1</b> чатам" in last_send_message(session).text
+    await send(cb("adm:send_img:yes"))
+    assert hoe.sink.photos == ["8"] and session.texts()[-1] == "✅ Надіслано 1 з 1 чатів."

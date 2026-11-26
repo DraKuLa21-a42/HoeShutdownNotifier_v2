@@ -67,7 +67,7 @@ SPECS: dict[str, Spec] = {s.name: s for s in (
     Spec("default_silent", "DEFAULT_SILENT", "bool", "Нові адреси без звуку",
          "Типове значення «Звук» для нових адрес.", "behaviour"),
     Spec("default_graphs", "DEFAULT_GRAPHS", "bool", "Нові адреси з графіком",
-         "Типове значення «Графік» для нових адрес.", "behaviour"),
+         "Типове значення «Графік: текст» і «Графік: картинка» для нових адрес.", "behaviour"),
     Spec("allowed_chat_ids", "ALLOWED_CHAT_IDS", "ids", "Дозволені чати",
          "Telegram ID чатів і користувачів через кому або пробіл. Порожньо (надішли «-») — бот відкритий для всіх. "
          "Адміністратори мають доступ завжди.", "access"),

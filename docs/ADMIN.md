@@ -216,7 +216,8 @@ street_id = "123456"
 house = "12"
 send_to = "tg"                 # tg | slack
 target = "-1001553812345"      # chat_id або ID каналу
-graphs = true
+graphs = true                  # текстовий графік
+graph_images = false           # графік-картинка (за замовчуванням — як graphs)
 queue = "1.1"                  # необов'язково: лише відключення цієї черги
 ```
 

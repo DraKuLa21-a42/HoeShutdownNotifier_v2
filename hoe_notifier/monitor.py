@@ -39,7 +39,9 @@ class GraphReport:
     page_ok: bool = True        # сторінку графіків вдалось завантажити
     image_found: bool = False   # на сторінці є картинка
     text_found: bool = False    # на сторінці є текстовий графік
-    targets: int = 0            # чатів із увімкненим «Графіком»
+    targets: int = 0            # чатів, яким потрібен графік у будь-якому вигляді
+    image_targets: int = 0      # чатів з увімкненою «Картинкою графіка»
+    text_targets: int = 0       # чатів з увімкненим «Текстом графіка»
     image_sent: int = 0         # скільком чатам доставлено картинку
     text_sent: int = 0          # скільком чатам доставлено текст
     error: str | None = None
@@ -197,7 +199,7 @@ class Monitor:
 
     # --- графіки (картинка та/або текст) ---------------------------------
     async def send_graphs(self, *, image: bool = True, text: bool = True, force: bool = False) -> GraphReport:
-        """Надсилає графік підписникам із увімкненим «Графіком».
+        """Надсилає графік: картинку — чатам з «Картинкою графіка», текст — чатам з «Текстом графіка».
 
         Без `force` — лише якщо він змінився з минулого разу (картинка — за URL, текст — за вмістом).
         `force=True` — розсилка вручну з адмін-панелі, незалежно від змін.
@@ -207,14 +209,16 @@ class Monitor:
         if graphs is None:
             report.page_ok = False
             return report
-        targets = self.db.graph_targets()
-        report.targets = len(targets)
+        image_targets = self.db.graph_targets(images=True)
+        text_targets = self.db.graph_targets()
+        report.image_targets, report.text_targets = len(image_targets), len(text_targets)
+        report.targets = len({(t.channel, t.target) for t in (*image_targets, *text_targets)})
         report.image_found, report.text_found, report.text = bool(graphs.image_url), bool(graphs.text), graphs.text
 
         if image and graphs.image_url and (force or graphs.image_url != self.db.kv_get("last_image_url")):
-            await self._publish_image(graphs.image_url, targets, report)
+            await self._publish_image(graphs.image_url, image_targets, report)
         if text and graphs.text and (force or graphs.text != self.db.kv_get("last_text_graph")):
-            await self._publish_text(graphs.text, targets, report, force=force)
+            await self._publish_text(graphs.text, text_targets, report, force=force)
         return report
 
     async def _publish_image(self, url: str, targets: list[GraphTarget], report: GraphReport) -> None:
