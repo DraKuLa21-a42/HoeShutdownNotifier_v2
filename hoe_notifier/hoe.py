@@ -90,6 +90,7 @@ class Graphs:
     """Графік, опублікований на сторінці погодинних відключень: картинка та/або текст."""
     image_url: str | None = None
     text: str | None = None
+    days: tuple = ()          # розпарсені графіки за датами (schedule.DaySchedule) — для картинок, які малює бот
 
 
 _TIME_RANGE = re.compile(r"\d{1,2}:\d{2}\s*[-–—]\s*\d{1,2}:\d{2}")
@@ -358,7 +359,13 @@ class HoeClient:
         except httpx.HTTPError as exc:
             log.warning("Не вдалось завантажити сторінку графіків: %s", exc)
             return None
-        return Graphs(image_url=parse_image_url(r.text, self.base_url), text=parse_text_schedule(r.text))
+        try:
+            from .schedule import parse_days
+            days = tuple(parse_days(r.text))
+        except Exception:
+            log.exception("Не вдалось розібрати графіки за датами")
+            days = ()
+        return Graphs(image_url=parse_image_url(r.text, self.base_url), text=parse_text_schedule(r.text), days=days)
 
     async def download(self, url: str) -> bytes:
         r = await self._client.get(url)

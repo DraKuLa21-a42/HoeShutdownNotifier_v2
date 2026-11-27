@@ -4,4 +4,5 @@ beautifulsoup4>=4.12
 python-dotenv>=1.0
 slack_sdk>=3.27          # доставка у Slack
 cryptography>=42         # шифрування паролів від особистого кабінету
+Pillow>=10.1             # картинка графіка, яку малює бот
 tomli>=2.0; python_version < "3.11"

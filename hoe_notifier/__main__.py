@@ -112,9 +112,16 @@ async def run() -> int:
         if settings.cabinet:
             log.info("Особистий кабінет: увімкнено, оновлення черг кожні %d с", settings.cabinet_sync_interval)
 
+    from .graph_images import GraphImages
+    from .render import available as render_problem
+
+    graph_images = GraphImages(db, sinks, enabled=settings.graph_render, live_minutes=settings.graph_live_minutes)
+    if settings.graph_render and render_problem():
+        log.warning("Картинки графіка не малюватимуться: %s", render_problem())
     monitor = Monitor(db, hoe, sinks, poll_interval=settings.poll_interval,
                       concurrency=settings.concurrency, admin_notify=admin_notify,
-                      cabinet=cabinet, cabinet_interval=settings.cabinet_sync_interval)
+                      cabinet=cabinet, cabinet_interval=settings.cabinet_sync_interval,
+                      graph_images=graph_images)
 
     http_clients = [hoe] + ([cabinet.client] if cabinet else [])
 
@@ -138,10 +145,15 @@ async def run() -> int:
             sinks["slack"].token = value
         elif name == "log_level":
             logging.getLogger().setLevel(value)
+        elif name == "graph_render":
+            graph_images.enabled = bool(value)
+        elif name == "graph_live_minutes":
+            graph_images.live_minutes = int(value)
 
     settings.on_change(apply_setting)
     settings.apply_all()
     monitor_task = asyncio.create_task(monitor.run_forever(), name="monitor")
+    graphs_task = asyncio.create_task(graph_images.run_forever(), name="graph-images")
 
     try:
         if bot:
@@ -162,7 +174,8 @@ async def run() -> int:
         pass
     finally:
         monitor_task.cancel()
-        await asyncio.gather(monitor_task, return_exceptions=True)
+        graphs_task.cancel()
+        await asyncio.gather(monitor_task, graphs_task, return_exceptions=True)
         if bot:
             await bot.session.close()
         await hoe.aclose()

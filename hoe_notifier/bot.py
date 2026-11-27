@@ -23,6 +23,7 @@ from .cabinet import CabinetAuthError, CabinetError, house_matches, mask_login, 
 from .config import Settings
 from .db import CabinetAccount, Database, Subscription
 from .hoe import HoeClient, SearchUnavailable, match_house, suggest_houses
+from .graph_images import REFRESH_CALLBACK
 from .monitor import MANUAL_REFRESH_MAX_AGE, TEXT_GRAPH_SUBJECT, Monitor, describe_state, label_for
 from .queues import QUEUES, filter_schedule, normalize_queue
 from .runtime import (
@@ -40,15 +41,19 @@ HELP = (
     "/cabinet — особистий кабінет cabinet.hoe.com.ua: точна черга з договору (якщо ввімкнено на сервері)\n"
     "/list — мої адреси та налаштування (сповіщення, графік, звук, черга)\n"
     "/check — перевірити всі мої адреси зараз\n"
-    "/graph — показати актуальний графік (картинку та/або текст); якщо вказано чергу — лише для неї, "
-    "<code>/graph all</code> — повністю\n"
+    "/graph — актуальний графік картинкою (сьогодні й завтра) з підсвіченою твоєю чергою; "
+    "<code>/graph text</code> — текстом, <code>/graph all</code> — без фільтра за чергою\n"
     "/admin — панель адміністратора (лише для ADMIN_IDS)\n"
     "/settings — налаштування сервісу під окремим паролем (лише для ADMIN_IDS)\n"
     "/subs — усі підписки всіх чатів (лише для ADMIN_IDS)\n"
     "/cancel — скасувати поточну дію\n\n"
     "<b>Фільтр за чергою.</b> У /list натисни «🔢 Черга» біля адреси й обери свою підчергу (1.1 – 6.2): "
     "бот надсилатиме лише відключення твоєї черги (і текстовий графік лише з нею). "
-    "Одразу під час додавання: <code>/add --queue=1.1</code>.\n"
+    "Одразу під час додавання: <code>/add --queue=1.1</code>.\n\n"
+    "<b>Графік: картинка.</b> Увімкни в /list — бот надсилатиме картинку графіка на завтра, щойно його "
+    "опублікують, а опівночі сам перетворить її на сьогоднішню (з лінією поточного часу й статусом), "
+    "учорашню — зробить сірою. Якщо графік змінять, прийде нова картинка з позначками змін, а стара стане "
+    "«Застарілою». Кнопка «🔄 Оновити» під картинкою перемальовує її зараз.\n"
     "Або дай боту логін і пароль від особистого кабінету — тоді черга береться з твого договору й оновлюється "
     "автоматично (пропонується під час /add у приватному чаті; керування — /cabinet).\n\n"
     "<b>Сповіщення в канал або групу.</b> Додай бота в канал адміністратором з правом "
@@ -1199,7 +1204,39 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
         else:
             sub = db.toggle(sub.id, "graph_images" if action == "gimg" else action)
             await cb.message.edit_reply_markup(reply_markup=sub_keyboard(sub))
+            if action == "gimg" and sub.graph_images:
+                await cb.answer(await send_current_images(sub))
+                return
         await cb.answer()
+
+    async def send_current_images(sub: Subscription) -> str | None:
+        """Щойно ввімкнули «Графік: картинка» — одразу надсилаємо актуальні графіки в чат цієї адреси."""
+        gi = monitor.graph_images
+        if gi is None:
+            return None
+        if gi.problem():
+            return f"Картинки, які малює бот, зараз недоступні: {gi.problem()}."
+        try:
+            await monitor.refresh_graphs(max_age=MANUAL_REFRESH_MAX_AGE)
+            sent = await gi.ensure_chat(sub.channel, sub.target, silent=sub.silent)
+        except Exception:
+            log.exception("Не вдалось надіслати актуальні картинки графіка")
+            return None
+        return "Надіслав актуальний графік." if sent else None
+
+    @router.callback_query(F.data.startswith(REFRESH_CALLBACK))
+    async def refresh_graph_image(cb: CallbackQuery) -> None:
+        gi = monitor.graph_images
+        day = cb.data[len(REFRESH_CALLBACK):]
+        if gi is None or cb.message is None or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
+            await cb.answer()
+            return
+        try:
+            hint = await gi.refresh("tg", str(cb.message.chat.id), str(cb.message.message_id), day)
+        except Exception:
+            log.exception("Не вдалось оновити картинку графіка")
+            hint = "Не вдалося оновити картинку."
+        await cb.answer(hint)
 
     @router.callback_query(F.data.regexp(r"^q:\d+:(\d\.\d|all|back|cab)$"))
     async def queue_action(cb: CallbackQuery, state: FSMContext) -> None:
@@ -1268,13 +1305,39 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
             await message.answer(f"На сайті зараз немає {kind}.")
         return shown
 
+    async def send_graph_images(message: Message, queues: frozenset[str] | None) -> bool:
+        """Картинки актуальних графіків (сьогодні/завтра), які малює бот. True — щось показано."""
+        gi = monitor.graph_images
+        if gi is None or gi.problem():
+            return False
+        await monitor.refresh_graphs(max_age=MANUAL_REFRESH_MAX_AGE)
+        shown = False
+        for png, caption, buttons in gi.snapshots(queues):
+            kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=t, callback_data=d)
+                                                        for t, d in buttons]]) if buttons else None
+            await message.answer_photo(BufferedInputFile(png, filename="graph.png"), caption=caption,
+                                       reply_markup=kb)
+            shown = True
+        return shown
+
     @router.message(Command("graph"))
     async def graph(message: Message, command: CommandObject) -> None:
         if not allowed(message.chat.id, message.from_user.id if message.from_user else 0):
             return
-        everything = (command.args or "").strip().lower() in {"all", "усі", "все"}
-        queues = None if everything else db.chat_queues("tg", str(message.chat.id))
-        await send_site_graph(message, queues=queues)
+        args = set((command.args or "").strip().lower().split())
+        everything = bool(args & {"all", "усі", "все"})
+        as_text = bool(args & {"text", "текст"})
+        if everything:
+            queues = None
+        else:
+            queues = (monitor.graph_images.chat_queues("tg", str(message.chat.id)) if monitor.graph_images
+                      else db.chat_queues("tg", str(message.chat.id)))
+        if not as_text and await send_graph_images(message, queues):
+            return
+        await send_site_graph(message, queues=queues, image=not as_text)
+        gi = monitor.graph_images
+        if not as_text and gi is not None and gi.problem():
+            await message.answer(f"ℹ️ Картинку графіка бот зараз не малює: {escape(gi.problem())}.")
 
     # --- меню налаштувань (окремий пароль) -----------------------------------
     unlocked: dict[int, float] = {}               # user_id → time.monotonic(), до якого діє сесія
@@ -1584,8 +1647,20 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
                 f"Адрес із фільтром за чергою: {s['with_queue']}\n"
                 + (f"Адрес із чергою з кабінету: {s['with_cabinet']} (акаунтів: {s['cabinet_accounts']})\n"
                    if cabinet_on() else "") +
+                f"{graph_images_status()}\n"
                 f"Останній цикл: {last} ({monitor.last_poll_summary})\n"
                 f"Інтервал: {settings.poll_interval} с")
+
+    def graph_images_status() -> str:
+        gi = monitor.graph_images
+        if gi is None:
+            return "Картинку графіка бот не малює"
+        problem = gi.problem()
+        if problem:
+            return f"Картинка графіка (малює бот): ❌ {problem}"
+        live = f", лінія часу кожні {gi.live_minutes} хв" if gi.live_minutes else ", без лінії часу"
+        return (f"Картинка графіка (малює бот): ✅{live}; актуальних графіків: {len(gi.current_days())}, "
+                f"живих повідомлень: {db.count_live_graph_messages()}")
 
     def admin_keyboard() -> InlineKeyboardMarkup:
         def btn(text: str, data: str) -> InlineKeyboardButton:
@@ -1604,6 +1679,8 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
                   "«Показати» — лише тобі. «Розіслати» — чатам, що ввімкнули відповідний графік: «Графік: текст» "
                   "або «Графік: картинка» (з підтвердженням); "
                   "автоматично графік надсилається сам, щойно змінюється на сайті.\n"
+                  "Картинку графіка бот малює сам із текстового графіка (сьогодні/завтра) і сам її оновлює; "
+                  "«Розіслати картинку-графік» надсилає всім свіжі копії (попередні стануть сірими).\n"
                   "«⚙️ Налаштування» (або /settings) — параметри сервісу без редагування .env, під окремим паролем.")
 
     @router.message(Command("admin"))
@@ -1738,6 +1815,8 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
             await cb.answer("Опитую сайт…")
             await monitor.poll_once()
             await cb.message.answer(f"🔄 Готово: {monitor.last_poll_summary}")
+        elif action == "show_img" and await send_graph_images(cb.message, None):
+            await cb.answer()
         elif action in {"show_text", "show_img"}:
             await cb.answer()
             await send_site_graph(cb.message, text=action == "show_text", image=action == "show_img")
@@ -1749,13 +1828,18 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
                 await cb.answer()
             elif confirm is None:
                 graphs = await hoe.fetch_graphs()
-                available = graphs and (graphs.text if as_text else graphs.image_url)
+                gi = monitor.graph_images
+                rendered = bool(graphs and graphs.days and gi is not None and gi.problem() is None)
+                available = graphs and (graphs.text if as_text else (graphs.image_url or rendered))
                 if graphs is None:
                     await cb.answer("Сторінку графіків не вдалося завантажити.", show_alert=True)
                 elif not available:
                     await cb.answer(f"На сайті зараз немає: {kind}.", show_alert=True)
                 else:
                     preview = ("\n\n" + escape(fit_body(graphs.text, 1200))) if as_text else ""
+                    if not as_text and rendered:
+                        preview = ("\n\nБот намалює свіжі картинки на сьогодні/завтра; попередні картинки в чатах "
+                                   "стануть сірими «Застарілими».")
                     targets = db.graph_targets(images=not as_text)
                     n = len(targets)
                     if as_text and any(t.queues for t in targets):

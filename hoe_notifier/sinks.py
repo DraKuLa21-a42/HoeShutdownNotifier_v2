@@ -22,6 +22,10 @@ class TargetMigrated(Exception):
         self.new_target = new_target
 
 
+class MessageGone(Exception):
+    """Повідомлення, яке треба відредагувати, видалено (або його вже не можна змінити)."""
+
+
 class ChannelError(Exception):
     """Канал не вдалося знайти або перевірити; текст призначений для користувача."""
 
@@ -62,6 +66,9 @@ class Sink(Protocol):
         """Надсилає повідомлення; повертає його ідентифікатор (для закріплення), якщо канал його дає."""
     async def send_photo(self, target: str, data: bytes, *, silent: bool) -> None: ...
     # Необов'язкові: закріпити / відкріпити повідомлення за ідентифікатором із send_text.
+    # Необов'язкові: картинка графіка з підписом і кнопками, яку потім можна оновлювати.
+    # async def send_graph(self, target, data, caption, *, silent, buttons=(), reply_to=None) -> str | None: ...
+    # async def edit_graph(self, target, message_id, data, caption, *, buttons=()) -> None: ...
     # async def pin(self, target: str, message_id: str) -> None: ...
     # async def unpin(self, target: str, message_id: str) -> None: ...
 
@@ -113,6 +120,47 @@ class TelegramSink:
             self.bot.send_photo, chat_id=int(target),
             photo=BufferedInputFile(data, filename="graph.png"), disable_notification=silent,
         )
+
+    @staticmethod
+    def _markup(buttons):
+        from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+        if not buttons:
+            return None
+        return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=t, callback_data=d)
+                                                      for t, d in buttons]])
+
+    async def send_graph(self, target, data, caption, *, silent, buttons=(), reply_to=None):
+        """Картинка графіка з підписом (HTML) і кнопками; повертає message_id для подальших оновлень."""
+        from aiogram.types import BufferedInputFile, ReplyParameters
+        reply = (ReplyParameters(message_id=int(reply_to), allow_sending_without_reply=True)
+                 if reply_to else None)
+        msg = await self._call(
+            self.bot.send_photo, chat_id=int(target), photo=BufferedInputFile(data, filename="graph.png"),
+            caption=caption, parse_mode="HTML", disable_notification=silent,
+            reply_markup=self._markup(buttons), reply_parameters=reply,
+        )
+        message_id = getattr(msg, "message_id", None)
+        return str(message_id) if message_id is not None else None
+
+    async def edit_graph(self, target, message_id, data, caption, *, buttons=()):
+        """Замінює картинку й підпис. MessageGone — повідомлення видалено; «не змінилось» — не помилка."""
+        from aiogram.exceptions import TelegramBadRequest
+        from aiogram.types import BufferedInputFile, InputMediaPhoto
+        try:
+            await self._call(
+                self.bot.edit_message_media, chat_id=int(target), message_id=int(message_id),
+                media=InputMediaPhoto(media=BufferedInputFile(data, filename="graph.png"), caption=caption,
+                                      parse_mode="HTML"),
+                reply_markup=self._markup(buttons),
+            )
+        except TelegramBadRequest as exc:
+            text = str(exc).lower()
+            if "not modified" in text:
+                return
+            if any(m in text for m in ("message to edit not found", "message_id_invalid", "can't be edited",
+                                       "message can't be edited", "message not found")):
+                raise MessageGone(str(exc)) from exc
+            raise
 
 
 SLACK_GONE_ERRORS = {"channel_not_found", "not_in_channel", "is_archived",
@@ -247,3 +295,11 @@ class SlackSink:
     async def send_photo(self, target, data, *, silent):
         client, channel = self._client_and_channel(target)
         await self._run(client.files_upload_v2, channel=channel, content=data, filename="graph.png")
+
+    async def send_graph(self, target, data, caption, *, silent, buttons=(), reply_to=None):
+        """У Slack картинку не оновлюємо — лише надсилаємо (підпис без HTML-розмітки)."""
+        client, channel = self._client_and_channel(target)
+        plain = re.sub(r"<[^>]+>", "", caption).replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+        await self._run(client.files_upload_v2, channel=channel, content=data, filename="graph.png",
+                        initial_comment=plain)
+        return None

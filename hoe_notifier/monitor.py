@@ -18,6 +18,7 @@ from .sinks import Sink, TargetGone, TargetMigrated
 
 if TYPE_CHECKING:
     from .cabinet import CabinetService
+    from .graph_images import GraphImages
 
 log = logging.getLogger(__name__)
 
@@ -46,6 +47,8 @@ class GraphReport:
     text_sent: int = 0          # скільком чатам доставлено текст
     error: str | None = None
     text: str | None = None     # текст графіка, як він на сайті
+    days: int = 0               # графіків за датами, з яких бот малює картинки
+    rendered: bool = False      # картинки малює бот (а не беруться з сайту)
 
 
 @dataclass
@@ -88,6 +91,7 @@ class Monitor:
         send_delay: float = 0.05,
         cabinet: CabinetService | None = None,
         cabinet_interval: int = 21600,
+        graph_images: GraphImages | None = None,
     ) -> None:
         self.db = db
         self.hoe = hoe
@@ -109,6 +113,10 @@ class Monitor:
         self.cabinet_interval = cabinet_interval
         self.cabinet_synced_at: float | None = None   # time.monotonic() останнього оновлення черг
         self._cabinet_lock = asyncio.Lock()
+        self.graph_images = graph_images
+        self._graphs_at: float | None = None          # time.monotonic() останньої перевірки сторінки графіків
+        if graph_images is not None:
+            graph_images.deliver = self._deliver      # недоступні/перенесені чати обробляються як для решти
 
     # --- одна адреса ----------------------------------------------------
     async def refresh_address(self, street_id: str, house: str, *, max_age: float = 0) -> Parsed | None:
@@ -214,8 +222,17 @@ class Monitor:
         report.image_targets, report.text_targets = len(image_targets), len(text_targets)
         report.targets = len({(t.channel, t.target) for t in (*image_targets, *text_targets)})
         report.image_found, report.text_found, report.text = bool(graphs.image_url), bool(graphs.text), graphs.text
+        report.days = len(graphs.days)
 
-        if image and graphs.image_url and (force or graphs.image_url != self.db.kv_get("last_image_url")):
+        gi = self.graph_images
+        if gi is not None and graphs.days and gi.problem() is None:
+            # картинку малює бот із текстового графіка; картинку з сайту в такому разі не дублюємо
+            report.rendered = report.image_found = True
+            if image:
+                result = await gi.publish(graphs.days, image_targets, force=force)
+                report.image_sent += result.sent
+                report.error = report.error or result.error
+        elif image and graphs.image_url and (force or graphs.image_url != self.db.kv_get("last_image_url")):
             await self._publish_image(graphs.image_url, image_targets, report)
         if text and graphs.text and (force or graphs.text != self.db.kv_get("last_text_graph")):
             await self._publish_text(graphs.text, text_targets, report, force=force)
@@ -252,6 +269,18 @@ class Monitor:
 
     async def check_graphs(self) -> None:
         await self.send_graphs()
+        self._graphs_at = time.monotonic()
+
+    async def refresh_graphs(self, *, max_age: float = 0) -> GraphReport | None:
+        """Перевірка сторінки графіків поза циклом (/graph, увімкнення картинки): розсилає лише зміни.
+
+        Якщо сторінку перевіряли менше `max_age` секунд тому — нічого не робить (None).
+        """
+        if max_age and self._graphs_at is not None and time.monotonic() - self._graphs_at < max_age:
+            return None
+        report = await self.send_graphs()
+        self._graphs_at = time.monotonic()
+        return report
 
     # --- черги з особистого кабінету --------------------------------------
     async def sync_cabinet(self, *, account_id: int | None = None) -> CabinetSyncReport:

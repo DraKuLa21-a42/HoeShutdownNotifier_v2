@@ -67,6 +67,34 @@ CREATE TABLE IF NOT EXISTS cabinet_accounts (
     UNIQUE (owner_id, login)
 );
 CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS graph_versions (    -- версії графіка на дату (розпарсені півгодинні слоти)
+    day        TEXT NOT NULL,                      -- YYYY-MM-DD
+    hash       TEXT NOT NULL,
+    slots      TEXT NOT NULL,                      -- JSON {черга: "0101…"}
+    updated    TEXT,                               -- «оновлено, 12:30» з сайту
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (day, hash)
+);
+CREATE TABLE IF NOT EXISTS graph_days (        -- актуальна версія графіка на дату
+    day        TEXT PRIMARY KEY,
+    hash       TEXT NOT NULL,
+    prev_hash  TEXT,                               -- попередня версія (для позначок змін)
+    updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS graph_messages (    -- надіслані картинки графіка, які бот оновлює
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel    TEXT NOT NULL,
+    target     TEXT NOT NULL,
+    day        TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    hash       TEXT NOT NULL,                      -- версія графіка на картинці
+    diff_hash  TEXT,                               -- з якою версією порівняно (позначки змін)
+    state      TEXT NOT NULL,                      -- future | today | past | superseded | gone
+    render_key TEXT,                               -- що намальовано (щоб не редагувати даремно)
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS graph_messages_live ON graph_messages (state);
+CREATE INDEX IF NOT EXISTS graph_messages_target ON graph_messages (channel, target, day);
 """
 
 TOGGLE_FIELDS = {"events", "graphs", "graph_images", "silent"}
@@ -134,6 +162,28 @@ class GraphTarget:
     target: str
     silent: bool
     queues: frozenset[str] | None
+
+
+@dataclass(frozen=True)
+class GraphMessage:
+    """Картинка графіка в чаті, яку бот підтримує актуальною (стан, лінія часу)."""
+    id: int
+    channel: str
+    target: str
+    day: str
+    message_id: str
+    hash: str
+    diff_hash: str | None
+    state: str
+    render_key: str | None
+    created_at: int
+
+    @property
+    def live(self) -> bool:
+        return self.state in LIVE_STATES
+
+
+LIVE_STATES = ("future", "today")
 
 
 @dataclass(frozen=True)
@@ -473,12 +523,17 @@ class Database:
                 "DELETE FROM subscriptions WHERE channel=? AND target=? AND source='bot'",
                 (channel, str(target)),
             )
+            self._conn.execute("UPDATE graph_messages SET state='gone' WHERE channel=? AND target=?",
+                               (channel, str(target)))
             self._conn.commit()
         return cur.rowcount
 
     def move_target(self, channel: str, old: str, new: str) -> None:
         """Група стала супергрупою → змінився chat_id. Переносимо підписки на новий ID."""
         with self._lock:
+            # старі повідомлення лишились у старому чаті — редагувати їх уже не вийде
+            self._conn.execute("UPDATE graph_messages SET state='gone' WHERE channel=? AND target=?",
+                               (channel, str(old)))
             self._conn.execute(
                 "UPDATE OR IGNORE subscriptions SET target=? WHERE channel=? AND target=?",
                 (str(new), channel, str(old)))
@@ -579,6 +634,99 @@ class Database:
                 (street_id, house, last_text, int(time.time())),
             )
             self._conn.commit()
+
+    # --- графіки-картинки -------------------------------------------------
+    def save_graph_version(self, day: str, hash_: str, slots_json: str, updated: str | None) -> str | None | bool:
+        """Записує графік на дату. False — така версія вже актуальна; інакше — хеш попередньої (None — дата нова)."""
+        now = int(time.time())
+        with self._lock:
+            row = self._conn.execute("SELECT hash FROM graph_days WHERE day=?", (day,)).fetchone()
+            self._conn.execute(
+                "INSERT INTO graph_versions (day,hash,slots,updated,created_at) VALUES (?,?,?,?,?) "
+                "ON CONFLICT(day,hash) DO UPDATE SET updated=COALESCE(excluded.updated, graph_versions.updated)",
+                (day, hash_, slots_json, updated, now))
+            if row and row["hash"] == hash_:
+                self._conn.commit()
+                return False
+            prev = row["hash"] if row else None
+            self._conn.execute(
+                "INSERT INTO graph_days (day,hash,prev_hash,updated_at) VALUES (?,?,?,?) "
+                "ON CONFLICT(day) DO UPDATE SET hash=excluded.hash, prev_hash=excluded.prev_hash, "
+                "updated_at=excluded.updated_at", (day, hash_, prev, now))
+            self._conn.commit()
+        return prev
+
+    def graph_day(self, day: str) -> tuple[str, str | None] | None:
+        """(актуальний хеш, попередній хеш) графіка на дату."""
+        with self._lock:
+            row = self._conn.execute("SELECT hash, prev_hash FROM graph_days WHERE day=?", (day,)).fetchone()
+        return (row["hash"], row["prev_hash"]) if row else None
+
+    def graph_version(self, day: str, hash_: str) -> tuple[str, str | None] | None:
+        """(JSON слотів, «оновлено» з сайту)."""
+        with self._lock:
+            row = self._conn.execute("SELECT slots, updated FROM graph_versions WHERE day=? AND hash=?",
+                                     (day, hash_)).fetchone()
+        return (row["slots"], row["updated"]) if row else None
+
+    def graph_days_since(self, day: str) -> list[str]:
+        with self._lock:
+            rows = self._conn.execute("SELECT day FROM graph_days WHERE day>=? ORDER BY day", (day,)).fetchall()
+        return [r["day"] for r in rows]
+
+    def add_graph_message(self, channel: str, target: str, day: str, message_id: str, hash_: str,
+                          diff_hash: str | None, state: str, render_key: str | None) -> GraphMessage:
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO graph_messages (channel,target,day,message_id,hash,diff_hash,state,render_key,created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (channel, str(target), day, str(message_id), hash_, diff_hash, state, render_key, int(time.time())))
+            self._conn.commit()
+            row = self._conn.execute("SELECT * FROM graph_messages WHERE id=?", (cur.lastrowid,)).fetchone()
+        return GraphMessage(**dict(row))
+
+    def update_graph_message(self, msg_id: int, **fields) -> None:
+        allowed = {"state", "render_key", "hash", "diff_hash"}
+        if not fields or set(fields) - allowed:
+            raise ValueError(fields)
+        cols = ", ".join(f"{k}=?" for k in fields)
+        with self._lock:
+            self._conn.execute(f"UPDATE graph_messages SET {cols} WHERE id=?", (*fields.values(), msg_id))
+            self._conn.commit()
+
+    def live_graph_messages(self, channel: str | None = None, target: str | None = None,
+                            day: str | None = None) -> list[GraphMessage]:
+        sql, args = f"SELECT * FROM graph_messages WHERE state IN ({','.join('?' * len(LIVE_STATES))})", \
+            list(LIVE_STATES)
+        for col, val in (("channel", channel), ("target", target), ("day", day)):
+            if val is not None:
+                sql += f" AND {col}=?"
+                args.append(str(val))
+        with self._lock:
+            rows = self._conn.execute(sql + " ORDER BY id", args).fetchall()
+        return [GraphMessage(**dict(r)) for r in rows]
+
+    def find_graph_message(self, channel: str, target: str, message_id: str) -> GraphMessage | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM graph_messages WHERE channel=? AND target=? AND message_id=? ORDER BY id DESC",
+                (channel, str(target), str(message_id))).fetchone()
+        return GraphMessage(**dict(row)) if row else None
+
+    def purge_graphs(self, before_day: str) -> None:
+        """Прибирає графіки й повідомлення, старші за дату (повідомлення до того вже переведені в «минув»)."""
+        with self._lock:
+            self._conn.execute("DELETE FROM graph_versions WHERE day<?", (before_day,))
+            self._conn.execute("DELETE FROM graph_days WHERE day<?", (before_day,))
+            self._conn.execute("DELETE FROM graph_messages WHERE day<? AND state NOT IN ('future','today')",
+                               (before_day,))
+            self._conn.commit()
+
+    def count_live_graph_messages(self) -> int:
+        with self._lock:
+            return self._conn.execute(
+                f"SELECT COUNT(*) FROM graph_messages WHERE state IN ({','.join('?' * len(LIVE_STATES))})",
+                LIVE_STATES).fetchone()[0]
 
     # --- службове -------------------------------------------------------
     def kv_get(self, key: str) -> str | None:

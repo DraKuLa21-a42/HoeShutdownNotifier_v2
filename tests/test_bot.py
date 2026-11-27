@@ -51,7 +51,7 @@ class FakeSession(BaseSession):
             raise TelegramBadRequest(method=method, message="Bad Request: chat not found")
         if name == "SendMessage" and method.chat_id in self.fail_send:
             raise TelegramForbiddenError(method=method, message="Forbidden: bot is not a member")
-        if name in {"SendMessage", "EditMessageText", "SendPhoto"}:
+        if name in {"SendMessage", "EditMessageText", "SendPhoto", "EditMessageMedia"}:
             return Message(message_id=len(self.methods), date=datetime.now(), chat=Chat(id=1, type="private"))
         if name == "GetChatMember":
             key = (method.chat_id, method.user_id)

@@ -63,6 +63,8 @@ class Settings:
     cabinet: bool = True                      # CABINET_ENABLED
     cabinet_base_url: str = "https://cabinet.hoe.com.ua"
     cabinet_sync_interval: int = 21600        # секунд між оновленнями черг із кабінету
+    graph_render: bool = True                 # GRAPH_RENDER: малювати картинку з текстового графіка
+    graph_live_minutes: int = 30              # GRAPH_LIVE_MINUTES: як часто оновлювати лінію часу (0 — ні)
 
     @property
     def cabinet_enabled(self) -> bool:
@@ -95,6 +97,8 @@ def load_settings(env_file: Path | None = None) -> Settings:
         cabinet=_bool(env("CABINET_ENABLED"), True),
         cabinet_base_url=(env("CABINET_BASE_URL") or "https://cabinet.hoe.com.ua").rstrip("/"),
         cabinet_sync_interval=max(900, int(env("CABINET_SYNC_INTERVAL", "21600"))),
+        graph_render=_bool(env("GRAPH_RENDER"), True),
+        graph_live_minutes=min(240, max(0, int(env("GRAPH_LIVE_MINUTES", "30")))),
     )
     if settings.secret_key:
         from .crypto import validate_key

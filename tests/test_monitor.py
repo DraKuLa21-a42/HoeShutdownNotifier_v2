@@ -15,6 +15,7 @@ class FakeHoe:
         self.fail = False
         self.graph_url = None
         self.graph_text = None
+        self.graph_days = ()
         self.page_down = False
         self.calls = 0
 
@@ -27,7 +28,7 @@ class FakeHoe:
     async def fetch_graphs(self):
         if self.page_down:
             return None
-        return Graphs(image_url=self.graph_url, text=self.graph_text)
+        return Graphs(image_url=self.graph_url, text=self.graph_text, days=self.graph_days)
 
     async def download(self, url):
         return b"PNG"
