@@ -65,6 +65,8 @@ class Settings:
     cabinet_sync_interval: int = 21600        # секунд між оновленнями черг із кабінету
     graph_render: bool = True                 # GRAPH_RENDER: малювати картинку з текстового графіка
     graph_live_minutes: int = 30              # GRAPH_LIVE_MINUTES: як часто оновлювати лінію часу (0 — ні)
+    log_file: Path | None = None              # LOG_FILE: файл журналу з ротацією (порожньо — без файлу)
+    log_file_max_mb: int = 2                  # LOG_FILE_MAX_MB: розмір одного файлу до ротації
 
     @property
     def cabinet_enabled(self) -> bool:
@@ -99,6 +101,9 @@ def load_settings(env_file: Path | None = None) -> Settings:
         cabinet_sync_interval=max(900, int(env("CABINET_SYNC_INTERVAL", "21600"))),
         graph_render=_bool(env("GRAPH_RENDER"), True),
         graph_live_minutes=min(240, max(0, int(env("GRAPH_LIVE_MINUTES", "30")))),
+        log_file=(None if env("LOG_FILE") is not None and not env("LOG_FILE").strip()
+                  else _path(env("LOG_FILE"), "data/hoe.log")),
+        log_file_max_mb=min(100, max(1, int(env("LOG_FILE_MAX_MB", "2")))),
     )
     if settings.secret_key:
         from .crypto import validate_key

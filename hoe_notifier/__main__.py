@@ -52,8 +52,11 @@ async def run() -> int:
         print(f"Помилка конфігурації: {exc}", file=sys.stderr)
         return 2
 
-    logging.basicConfig(level=settings.log_level,
-                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    from .logview import setup_logging
+
+    # буфер для перегляду журналу з /admin; секрети маскуються в усіх виходах
+    setup_logging(settings.log_level, log_file=settings.log_file, max_mb=settings.log_file_max_mb,
+                  secrets=tuple(x for x in (settings.bot_token, settings.slack_token, settings.secret_key) if x))
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
     box = None

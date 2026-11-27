@@ -24,6 +24,7 @@ from .config import Settings
 from .db import CabinetAccount, Database, Subscription
 from .hoe import HoeClient, SearchUnavailable, match_house, suggest_houses
 from .graph_images import REFRESH_CALLBACK
+from . import logview
 from .monitor import MANUAL_REFRESH_MAX_AGE, TEXT_GRAPH_SUBJECT, Monitor, describe_state, label_for
 from .queues import QUEUES, filter_schedule, normalize_queue
 from .runtime import (
@@ -46,6 +47,7 @@ HELP = (
     "/admin — панель адміністратора (лише для ADMIN_IDS)\n"
     "/settings — налаштування сервісу під окремим паролем (лише для ADMIN_IDS)\n"
     "/subs — усі підписки всіх чатів (лише для ADMIN_IDS)\n"
+    "/logs — журнал сервісу; <code>/logs warn</code>, <code>/logs error</code> (лише для ADMIN_IDS)\n"
     "/cancel — скасувати поточну дію\n\n"
     "<b>Фільтр за чергою.</b> У /list натисни «🔢 Черга» біля адреси й обери свою підчергу (1.1 – 6.2): "
     "бот надсилатиме лише відключення твоєї черги (і текстовий графік лише з нею). "
@@ -1667,7 +1669,7 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
             return InlineKeyboardButton(text=text, callback_data=data)
         return InlineKeyboardMarkup(inline_keyboard=[
             [btn("📊 Статистика", "adm:stats"), btn("🔄 Опитати зараз", "adm:poll")],
-            [btn("👥 Усі підписки", "adm:subs:0")],
+            [btn("👥 Усі підписки", "adm:subs:0"), btn("📜 Журнал", "log:open")],
             [btn("📋 Показати текстовий графік", "adm:show_text")],
             [btn("🖼 Показати картинку-графік", "adm:show_img")],
             [btn("📤 Розіслати текстовий графік", "adm:send_text")],
@@ -1681,6 +1683,7 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
                   "автоматично графік надсилається сам, щойно змінюється на сайті.\n"
                   "Картинку графіка бот малює сам із текстового графіка (сьогодні/завтра) і сам її оновлює; "
                   "«Розіслати картинку-графік» надсилає всім свіжі копії (попередні стануть сірими).\n"
+                  "«📜 Журнал» (або /logs) — останні записи журналу сервісу з фільтром і вивантаженням файлом.\n"
                   "«⚙️ Налаштування» (або /settings) — параметри сервісу без редагування .env, під окремим паролем.")
 
     @router.message(Command("admin"))
@@ -1783,6 +1786,85 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
         arg = (command.args or "").strip()
         text, kb = await subs_page(bot, int(arg) - 1 if arg.isdigit() else 0)
         await message.answer(text, reply_markup=kb)
+
+    # ------------------------------------------------------------ журнал сервісу
+    LOG_FILTER_ARGS = {"": "a", "all": "a", "усі": "a", "warn": "w", "warning": "w", "w": "w",
+                       "попередження": "w", "error": "e", "errors": "e", "err": "e", "e": "e", "помилки": "e"}
+
+    def log_view(flt: str, anchor: int = 0, direction: str = "l") -> tuple[str, InlineKeyboardMarkup]:
+        buf = logview.get_buffer()
+        source = "у пам'яті" if buf is None or buf.file_path is None else f"файл {buf.file_path.name}"
+        records = buf.snapshot() if buf is not None else []
+        pg = logview.page(records, flt, anchor=anchor, direction=direction)
+        head = f"<b>📜 Журнал</b> · {logview.FILTER_TITLES[flt]}"
+        if buf is None:
+            body = "<i>Журнал недоступний: буфер не налаштовано (бот запущено не через python -m hoe_notifier).</i>"
+        elif not pg.records:
+            body = "<i>Записів немає.</i>" if flt == "a" else "<i>Таких записів немає — і це добре.</i>"
+        else:
+            today = time.strftime("%Y-%m-%d")
+            shown = "\n".join(logview.format_record(r, today=today) for r in pg.records)
+            body = f"<pre>{escape(shown)}</pre>"
+        info = f"\n<i>Показано {len(pg.records)} з {pg.total} · джерело: {source} · рівень журналу {settings.log_level}</i>"
+        text = f"{head}\n{body}{info}"
+
+        def btn(label: str, data: str) -> InlineKeyboardButton:
+            return InlineKeyboardButton(text=label, callback_data=data)
+        nav = []
+        if pg.has_older:
+            nav.append(btn("◀ Старіші", f"log:v:{flt}:{pg.records[0].seq}:o"))
+        nav.append(btn("🔄 Найновіші", f"log:v:{flt}:0:l"))
+        if pg.has_newer:
+            nav.append(btn("Новіші ▶", f"log:v:{flt}:{pg.records[-1].seq}:n"))
+        filters = [btn(("• " if key == flt else "") + label, f"log:v:{key}:0:l")
+                   for key, label in (("a", "Усі"), ("w", "⚠️ Попередж."), ("e", "❌ Помилки"))]
+        return text, InlineKeyboardMarkup(inline_keyboard=[nav, filters, [btn("📄 Файлом", f"log:file:{flt}")]])
+
+    @router.message(Command("logs"))
+    async def logs_command(message: Message, command: CommandObject) -> None:
+        if not message.from_user or not is_admin_private(message.chat.type, message.from_user.id):
+            return
+        arg = (command.args or "").strip().lower()
+        flt = LOG_FILTER_ARGS.get(arg)
+        if flt is None:
+            await message.answer("Формат: <code>/logs</code>, <code>/logs warn</code> або <code>/logs error</code>.")
+            return
+        text, kb = log_view(flt)
+        await message.answer(text, reply_markup=kb)
+
+    @router.callback_query(F.data.regexp(r"^log:(open|v:[awe]:\d+:[lon]|file:[awe])$"))
+    async def logs_action(cb: CallbackQuery) -> None:
+        if not is_admin_private(cb.message.chat.type, cb.from_user.id):
+            await cb.answer("Лише для адміністраторів.", show_alert=True)
+            return
+        parts = cb.data.split(":")
+        if parts[1] == "open":
+            text, kb = log_view("a")
+            await cb.message.answer(text, reply_markup=kb)
+            await cb.answer()
+            return
+        if parts[1] == "v":
+            text, kb = log_view(parts[2], int(parts[3]), parts[4])
+            try:
+                await cb.message.edit_text(text, reply_markup=kb)
+            except TelegramAPIError:    # «message is not modified» — нових записів немає
+                pass
+            await cb.answer()
+            return
+        flt = parts[2]
+        buf = logview.get_buffer()
+        data = buf.file_tail() if buf is not None and flt == "a" else None
+        if data is None:
+            records = logview.filtered(buf.snapshot(), flt) if buf is not None else []
+            data = logview.as_text(records).encode("utf-8")
+        if not data:
+            await cb.answer("Журнал порожній.", show_alert=True)
+            return
+        name = f"hoe-{time.strftime('%Y%m%d-%H%M%S')}{'' if flt == 'a' else '-' + flt}.log"
+        await cb.answer()
+        caption = "Журнал сервісу" + ("" if flt == "a" else f" ({logview.FILTER_TITLES[flt]})")
+        log.info("Адмін %s вивантажив журнал (%s, %d байт)", cb.from_user.id, logview.FILTER_TITLES[flt], len(data))
+        await cb.message.answer_document(BufferedInputFile(data, filename=name), caption=caption)
 
     @router.message(Command("stats"))
     async def stats(message: Message) -> None:
