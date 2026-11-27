@@ -1632,7 +1632,7 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
                 except Exception:   # чат недоступний — покажемо лише ID
                     pass
         lines, last = [f"<b>Підписки</b> ({len(subs)}), сторінка {page + 1}/{pages}"], None
-        for sub in chunk:
+        for n, sub in enumerate(chunk, start=1):
             key = (sub.channel, sub.target)
             if key != last:
                 title = titles.get(sub.target, "")
@@ -1642,13 +1642,61 @@ def build_router(settings: Settings, db: Database, hoe: HoeClient, monitor: Moni
                     (" 🖼графік" if sub.graph_images else "") + \
                     ("" if sub.silent else " 🔔зі звуком") + (" 🔒" if sub.source == "config" else "")
             queue = (f" · черга {sub.queue}" + (" 🔐" if sub.queue_from_cabinet else "")) if sub.queue else ""
-            lines.append(f"• {escape(sub.label)}{queue} <code>({sub.street_id}, {escape(sub.house)})</code>{flags}")
+            lines.append(f"{n}. {escape(sub.label)}{queue} <code>({sub.street_id}, {escape(sub.house)})</code>{flags}")
+        lines.append("\n<i>🗑 N — видалити підписку з номером N (з підтвердженням).</i>")
+        # Кнопки видалення: по 5 у рядку, номер — як у списку. Підписки з addresses.toml (🔒) з бота не видаляються.
+        dels = [InlineKeyboardButton(text=f"🗑 {n}", callback_data=f"adm:del:{sub.id}:{page}")
+                for n, sub in enumerate(chunk, start=1) if sub.source != "config"]
+        rows = [dels[i:i + 5] for i in range(0, len(dels), 5)]
         nav = []
         if page > 0:
             nav.append(InlineKeyboardButton(text="◀", callback_data=f"adm:subs:{page - 1}"))
         if page < pages - 1:
             nav.append(InlineKeyboardButton(text="▶", callback_data=f"adm:subs:{page + 1}"))
-        return "\n".join(lines), (InlineKeyboardMarkup(inline_keyboard=[nav]) if nav else None)
+        if nav:
+            rows.append(nav)
+        return "\n".join(lines), (InlineKeyboardMarkup(inline_keyboard=rows) if rows else None)
+
+    @router.callback_query(F.data.regexp(r"^adm:(del|delok):\d+:\d+$"))
+    async def admin_delete_sub(cb: CallbackQuery) -> None:
+        if cb.from_user.id not in settings.admin_ids or cb.message.chat.type != ChatType.PRIVATE:
+            await cb.answer("Лише для адміністраторів.", show_alert=True)
+            return
+        _, action, sub_id, page = cb.data.split(":")
+        sub, page = db.get_subscription(int(sub_id)), int(page)
+
+        async def back_to_list(toast: str | None = None, alert: bool = False) -> None:
+            text, kb = await subs_page(cb.bot, page)
+            try:
+                await cb.message.edit_text(text, reply_markup=kb)
+            except TelegramAPIError:
+                pass
+            await cb.answer(toast, show_alert=alert)
+
+        if sub is None:
+            await back_to_list("Цієї підписки вже немає.")
+            return
+        if sub.source == "config":
+            await back_to_list("Ця підписка з addresses.toml — видаліть запис у файлі й перезапустіть сервіс.", True)
+            return
+        if action == "del":
+            queue = f", черга {sub.queue}" if sub.queue else ""
+            kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="🗑 Так, видалити", callback_data=f"adm:delok:{sub.id}:{page}"),
+                InlineKeyboardButton(text="↩ Назад", callback_data=f"adm:subs:{page}"),
+            ]])
+            await cb.message.edit_text(
+                f"Видалити підписку?\n\n📍 <b>{escape(sub.label)}</b>{escape(queue)}\n"
+                f"Куди: <code>{sub.channel}:{escape(sub.target)}</code>\n"
+                f"streetId: <code>{escape(sub.street_id)}</code>, будинок: <code>{escape(sub.house)}</code>\n\n"
+                "Чат не отримає жодного повідомлення про це.", reply_markup=kb)
+            await cb.answer()
+            return
+        db.delete_subscription(sub.id)
+        db.kv_delete(f"queue_pin:{sub.id}")     # закріплене повідомлення про чергу більше не відстежуємо
+        log.info("Адмін %s видалив підписку #%s (%s, %s:%s)", cb.from_user.id, sub.id, sub.label,
+                 sub.channel, sub.target)
+        await back_to_list(f"Видалено: {sub.label}")
 
     @router.message(Command("subs"))
     async def subs_command(message: Message, command: CommandObject, bot: Bot) -> None:

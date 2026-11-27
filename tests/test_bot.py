@@ -778,3 +778,66 @@ async def test_admin_send_image_only_to_image_subscribers(env):
     assert "<b>1</b> чатам" in last_send_message(session).text
     await send(cb("adm:send_img:yes"))
     assert hoe.sink.photos == ["8"] and session.texts()[-1] == "✅ Надіслано 1 з 1 чатів."
+
+# ------------------------------------------------ видалення підписок з адмінки
+def last_markup_method(session):
+    return [m for m in session.methods if type(m).__name__ in {"SendMessage", "EditMessageText"}][-1]
+
+
+async def test_admin_subs_list_has_delete_buttons(env):
+    db, hoe, session, send, msg, cb = env
+    a, _ = db.add_subscription("tg", "7", "10", "5", "A")
+    db.sync_config_subscriptions([{"channel": "tg", "target": "8", "street_id": "11", "house": "6",
+                                   "label": "cfg", "events": True, "graphs": False, "silent": True}])
+    await send(cb("adm:subs:0"))
+    m = last_markup_method(session)
+    assert "1. A" in m.text and "2. cfg" in m.text
+    datas = [b.callback_data for row in m.reply_markup.inline_keyboard for b in row]
+    assert datas == [f"adm:del:{a.id}:0"]                     # для 🔒 з addresses.toml кнопки немає
+
+
+async def test_admin_delete_sub_requires_confirmation(env):
+    db, hoe, session, send, msg, cb = env
+    a, _ = db.add_subscription("tg", "7", "10", "5", "Дім", queue="3.1")
+    db.add_subscription("tg", "7", "11", "6", "Офіс")
+    db.kv_set(f"queue_pin:{a.id}", '{"target": "7", "message": "5"}')
+
+    await send(cb(f"adm:del:{a.id}:0"))
+    m = last_markup_method(session)
+    assert "Видалити підписку?" in m.text and "Дім" in m.text and "черга 3.1" in m.text
+    assert db.get_subscription(a.id) is not None               # ще не видалено
+    assert "🗑 Так, видалити" in button_texts(m)
+
+    await send(cb(f"adm:delok:{a.id}:0"))
+    assert db.get_subscription(a.id) is None
+    assert db.kv_get(f"queue_pin:{a.id}") is None
+    assert [s.label for s in db.all_subscriptions()] == ["Офіс"]
+    assert "1. Офіс" in last_markup_method(session).text       # повернулись до списку
+    assert hoe.sink.texts == []                                # чату нічого не надсилали
+
+
+async def test_admin_delete_back_keeps_sub(env):
+    db, hoe, session, send, msg, cb = env
+    a, _ = db.add_subscription("tg", "7", "10", "5", "Дім")
+    await send(cb(f"adm:del:{a.id}:0"))
+    await send(cb("adm:subs:0"))
+    assert db.get_subscription(a.id) is not None
+
+
+async def test_admin_cannot_delete_config_sub_or_missing(env):
+    db, hoe, session, send, msg, cb = env
+    db.sync_config_subscriptions([{"channel": "tg", "target": "8", "street_id": "11", "house": "6",
+                                   "label": "cfg", "events": True, "graphs": False, "silent": True}])
+    cfg = db.all_subscriptions()[0]
+    await send(cb(f"adm:delok:{cfg.id}:0"))
+    assert db.get_subscription(cfg.id) is not None and "addresses.toml" in alerts(session)[-1].text
+    await send(cb("adm:delok:999:0"))                          # уже видалена — просто список
+    assert db.get_subscription(cfg.id) is not None
+
+
+async def test_admin_delete_rejected_for_non_admins():
+    db, hoe, session, send, msg, cb = make_env(admin_ids=frozenset())
+    a, _ = db.add_subscription("tg", "7", "10", "5", "Дім")
+    await send(cb(f"adm:delok:{a.id}:0"))
+    assert db.get_subscription(a.id) is not None and alerts(session)
+    db.close()
