@@ -219,3 +219,37 @@ def test_render_all_states():
                                 previous=d.slots if state == "today" else None,
                                 now=datetime(2026, 11, 28, 13, 0, tzinfo=KYIV), site_updated="12:30")
         assert png[:8] == b"\x89PNG\r\n\x1a\n" and len(png) > 10_000
+
+
+async def test_slack_messages_are_tracked_and_updated_without_buttons(env):
+    db, sink, gi, clock = env
+
+    class SlackLike(GraphSink):
+        async def send_graph(self, target, data, caption, *, silent, buttons=(), reply_to=None):
+            assert buttons == () and reply_to is None
+            await super().send_graph(target, data, caption, silent=silent)
+            return f"ts{self.n}|F{self.n}"
+
+        async def edit_graph(self, target, message_id, data, caption, *, buttons=()):
+            assert buttons == ()
+            await super().edit_graph(target, message_id, data, caption)
+            self.n += 1
+            return f"{message_id.split('|')[0]}|F{self.n}"
+
+    slack = SlackLike()
+    gi.sinks["slack"] = slack
+    db.add_subscription("slack", "1/C1", "10", "5", "Дім", queue="4.2", graph_images=True)
+    S = GraphTarget("slack", "1/C1", True, frozenset({"4.2"}))
+    await gi.publish([day(TOMORROW, "Підчерга 4.2 – 10:00-12:00.")], [S])
+    await gi.publish([day(TOMORROW, "Підчерга 4.2 – 10:00-13:00.")], [S])        # нова версія
+    assert slack.edits[-1]["id"] == "ts101|F101" and "Застарів" in slack.edits[-1]["caption"]
+    clock.set(2026, 11, 28, 0, 0)
+    assert await gi.tick() == 1
+    live = db.live_graph_messages("slack")
+    assert len(live) == 1 and live[0].message_id == "ts102|F104"                 # ідентифікатор файлу оновлено
+    assert await gi.ensure_chat("slack", "1/C1") == 0                            # без повторів
+
+    db.set_queue(db.list_subscriptions("slack", "1/C1")[0].id, None)               # без черги: підказки про /list немає
+    caption = gi.compose("2026-11-28", live[0].hash, "today", None, channel="slack")[1]
+    assert "Усі черги." in caption and "/list" not in caption
+    assert "/list" in gi.compose("2026-11-28", live[0].hash, "today", None)[1]

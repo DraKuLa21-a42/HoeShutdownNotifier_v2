@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Awaitable, Callable
 from .db import CABINET_AUTH_FAILED, AddressState, CabinetAccount, Database, GraphTarget, Subscription
 from .hoe import NO_OUTAGES, HoeClient, HoeUnavailable, ParseStatus, Parsed, parse_events
 from .queues import filter_schedule, normalize_queue, outage_view
-from .sinks import Sink, TargetGone, TargetMigrated
+from .sinks import MissingScope, Sink, TargetGone, TargetMigrated
 
 if TYPE_CHECKING:
     from .cabinet import CabinetService
@@ -182,6 +182,10 @@ class Monitor:
                 removed = self.db.delete_target(sub.channel, sub.target)
                 log.warning("Адресат %s/%s недоступний, видалено підписок: %d (%s)",
                             sub.channel, sub.target, removed, exc)
+                return False, None, sub
+            except MissingScope as exc:
+                log.warning("Slack %s: %s — додай право в налаштуваннях застосунку Slack", sub.target, exc)
+                await self._warn_missing_scope(exc)
                 return False, None, sub
             except Exception:
                 log.exception("Не вдалось надіслати повідомлення %s/%s", sub.channel, sub.target)
@@ -401,6 +405,23 @@ class Monitor:
             self.db.kv_set(key, json.dumps({"target": sub.target, "message": message_id}))
         else:
             self.db.kv_delete(key)
+
+    async def _warn_missing_scope(self, exc: MissingScope) -> None:
+        """Один раз на (бот, право) пишемо в Telegram тому, хто підключив Slack-бота, що саме додати."""
+        bot_id = exc.target.split("/", 1)[0]
+        bot = self.db.get_slack_bot(int(bot_id)) if bot_id.isdigit() else None
+        if bot is None:
+            return
+        key = f"slack_scope_warned:{bot.id}:{exc.needed}"
+        if self.db.kv_get(key):
+            return
+        self.db.kv_set(key, str(int(time.time())))
+        await self._notify_owner(
+            bot.owner_id, "Slack-боту бракує права",
+            f"Бот «{bot.bot_name}» ({bot.team}) не може надіслати картинку графіка: немає права {exc.needed}.\n\n"
+            f"api.slack.com/apps → твій застосунок → OAuth & Permissions → Bot Token Scopes → додай "
+            f"{exc.needed} → вгорі сторінки «Reinstall to Workspace». Якщо після цього токен xoxb-… зміниться, "
+            "підключи бота заново в /slack.")
 
     async def _notify_owner(self, owner_id: int, subject: str, body: str) -> None:
         sink = self.sinks.get("tg")

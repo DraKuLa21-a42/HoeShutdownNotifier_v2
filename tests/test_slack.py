@@ -368,3 +368,92 @@ async def test_sink_revoked_token_and_inspect():
         await s.inspect("xoxb-test-token-0000")
     ok = sink_with(PostClient())
     assert await ok.inspect("xoxb-test-token-0000") == ("Acme", "hoebot")
+
+# --- картинка графіка, яку бот оновлює в Slack ---------------------------------------------
+class GraphClient:
+    """Підставний WebClient: приватні файли, повідомлення з image-блоком, chat.update, files.delete."""
+
+    def __init__(self, not_ready=0, gone=False):
+        self.files, self.deleted, self.posts, self.updates = [], [], [], []
+        self.not_ready, self.gone = not_ready, gone
+
+    def _err(self, code):
+        from slack_sdk.errors import SlackApiError
+        return SlackApiError("x", {"ok": False, "error": code})
+
+    def files_upload_v2(self, **kw):
+        assert "channel" not in kw and "channel_id" not in kw          # файл не публікується в канал
+        fid = f"F{len(self.files) + 1}"
+        self.files.append(fid)
+        return {"ok": True, "files": [{"id": fid}]}
+
+    def chat_postMessage(self, **kw):
+        if self.not_ready:
+            self.not_ready -= 1
+            raise self._err("invalid_blocks")
+        self.posts.append(kw)
+        return {"ok": True, "ts": "1700000000.000100"}
+
+    def chat_update(self, **kw):
+        if self.gone:
+            raise self._err("message_not_found")
+        self.updates.append(kw)
+        return {"ok": True}
+
+    def files_delete(self, file):
+        self.deleted.append(file)
+        return {"ok": True}
+
+
+async def test_slack_graph_send_and_update_in_place():
+    pytest.importorskip("slack_sdk")
+    client = GraphClient(not_ready=1)
+    s = sink_with(client)
+    s.GRAPH_RETRIES = (0, 0, 0)
+    target = f"{s.bot_id}/C0123ABCD"
+    mid = await s.send_graph(target, b"PNG", "📅 <b>Завтра</b>\n<i>x &amp; y</i>", silent=True,
+                             buttons=[("🔄", "gimg:r:x")])
+    assert mid == "1700000000.000100|F1"
+    post = client.posts[0]
+    assert post["channel"] == "C0123ABCD"
+    assert post["blocks"][0]["text"]["text"] == "📅 *Завтра*\n_x & y_"
+    assert post["blocks"][1] == {"type": "image", "slack_file": {"id": "F1"}, "alt_text": "Графік погодинних відключень"}
+
+    new = await s.edit_graph(target, mid, b"PNG2", "📆 <b>Сьогодні</b>")
+    assert new == "1700000000.000100|F2"
+    assert client.updates[0]["ts"] == "1700000000.000100"
+    assert client.updates[0]["blocks"][1]["slack_file"] == {"id": "F2"}
+    assert client.deleted == ["F1"]                                  # старий файл прибрано
+
+
+async def test_slack_graph_deleted_message():
+    pytest.importorskip("slack_sdk")
+    from hoe_notifier.sinks import MessageGone
+    client = GraphClient(gone=True)
+    s = sink_with(client)
+    with pytest.raises(MessageGone):
+        await s.edit_graph(f"{s.bot_id}/C1", "1.2|F9", b"PNG", "x")
+    assert client.deleted == ["F1"]                                  # новий файл не лишається сиротою
+
+
+async def test_missing_files_scope_warns_owner_once():
+    pytest.importorskip("slack_sdk")
+    from slack_sdk.errors import SlackApiError
+
+    class NoFiles(GraphClient):
+        def files_upload_v2(self, **kw):
+            raise SlackApiError("x", {"ok": False, "error": "missing_scope", "needed": "files:write"})
+
+    db, hoe, session, send, msg, cb = make_env()
+    bot, _ = db.add_slack_bot(42, TOKEN, "Acme", "hoebot")
+    real = SlackSink(None, db)
+    real._clients[TOKEN] = NoFiles()
+    hoe.monitor.sinks["slack"] = real
+    db.add_subscription("slack", f"{bot.id}/C0123ABCD", "10", "5", "A", graph_images=True)
+    hoe.graph_url = "https://x/1.png"
+    await hoe.monitor.send_graphs(text=False, force=True)
+    await hoe.monitor.send_graphs(text=False, force=True)
+    warned = [t for t in hoe.sink.texts if t[1] == "Slack-боту бракує права"]
+    assert len(warned) == 1 and warned[0][0] == "42" and "files:write" in warned[0][3]
+    assert db.list_subscriptions("slack", f"{bot.id}/C0123ABCD")                     # підписку не видалено
+    db.close()

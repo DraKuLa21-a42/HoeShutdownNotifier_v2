@@ -686,7 +686,7 @@ class Database:
         return GraphMessage(**dict(row))
 
     def update_graph_message(self, msg_id: int, **fields) -> None:
-        allowed = {"state", "render_key", "hash", "diff_hash"}
+        allowed = {"state", "render_key", "hash", "diff_hash", "message_id"}
         if not fields or set(fields) - allowed:
             raise ValueError(fields)
         cols = ", ".join(f"{k}=?" for k in fields)

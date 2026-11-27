@@ -7,7 +7,8 @@
   * протягом дня лінія часу й статус у підписі оновлюються раз на `live_minutes` хвилин;
   * графік на дату змінили — нове повідомлення з позначками змін (зі звуком, лише якщо зміни стосуються
     черг чату), попереднє стає сірим «Застарілим» і на нього дається відповідь.
-Slack отримує лише нові картинки (там повідомлення не редагуються).
+У Slack так само, лише без кнопки «Оновити» і без відповіді на попереднє повідомлення (картинка в Slack —
+приватний файл бота в image-блоці; оновлення — chat.update з новим файлом).
 """
 from __future__ import annotations
 
@@ -113,7 +114,7 @@ class GraphImages:
 
     def compose(self, day: str, hash_: str, state: str, queues: frozenset[str] | None, *,
                 diff_hash: str | None = None, now: datetime | None = None, snapshot: bool = False,
-                footer: str | None = None) -> tuple[bytes, str, list[tuple[str, str]]]:
+                footer: str | None = None, channel: str = "tg") -> tuple[bytes, str, list[tuple[str, str]]]:
         """(PNG, підпис, кнопки) для версії `hash_` графіка на `day` у стані `state`."""
         data = self.version_slots(day, hash_)
         if data is None:
@@ -129,12 +130,13 @@ class GraphImages:
                                 previous=prev_slots if state in {"today", "future"} else None,
                                 site_updated=updated, now=now if show_now else None, footer=footer)
         caption = self.caption(d, state, slots, queues, prev_slots=prev_slots, updated=updated, now=now,
-                               snapshot=snapshot)
+                               snapshot=snapshot, channel=channel)
         buttons = [("🔄 Оновити", REFRESH_CALLBACK + day)] if state in {"today", "future"} else []
         return png, caption, buttons
 
     def caption(self, d: date, state: str, slots: dict, queues: frozenset[str] | None, *,
-                prev_slots: dict | None, updated: str | None, now: datetime, snapshot: bool = False) -> str:
+                prev_slots: dict | None, updated: str | None, now: datetime, snapshot: bool = False,
+                channel: str = "tg") -> str:
         today = now.date()
         when = f"{relative_word(d, today)}, {day_label(d)}" if abs((d - today).days) <= 1 else day_label(d)
         head = {
@@ -157,8 +159,10 @@ class GraphImages:
                     lines.append(f"зміни: {diff}" if diff else "для цієї черги без змін")
                 if state == "today":
                     lines.append(status_now(slots[q], now, with_left=snapshot))
-        else:
+        elif channel == "tg":
             lines.append("\nУсі черги. Свою чергу можна обрати в /list → «🔢 Черга» — її буде підсвічено.")
+        else:   # у Slack команд бота немає — чергу задають у Telegram, тож підказка там лише заплутує
+            lines.append("\nУсі черги.")
         if state == "today":
             lines.append(f"\n<i>{'Знімок' if snapshot else 'Оновлюється автоматично'} · {now.strftime('%H:%M')}</i>")
         return "\n".join(lines)
@@ -233,21 +237,22 @@ class GraphImages:
             if prev and t.queues is not None and all(prev[0][q] == data.slots[q] for q in t.queues):
                 silent = True                         # зміни не стосуються черг цього чату — тихо
         try:
-            png, caption, buttons = self.compose(day, data.hash, state, t.queues, diff_hash=diff_hash, now=now)
+            png, caption, buttons = self.compose(day, data.hash, state, t.queues, diff_hash=diff_hash, now=now,
+                                                 channel=t.channel)
         except Exception:
             log.exception("Не вдалось намалювати графік %s", day)
             return False
         sink = self.sinks.get(t.channel)
+        tg = t.channel == "tg"                        # кнопки й відповіді — лише в Telegram
         if sink is not None and hasattr(sink, "send_graph"):
-            reply_to = old_live[-1].message_id if old_live and kind == "update" and t.channel == "tg" else None
+            reply_to = old_live[-1].message_id if old_live and kind == "update" and tg else None
             ok, message_id, delivered = await self.deliver(t, "send_graph", png, caption, silent=silent,
-                                                           buttons=buttons if t.channel == "tg" else (),
-                                                           reply_to=reply_to)
+                                                           buttons=buttons if tg else (), reply_to=reply_to)
         else:
             ok, message_id, delivered = await self.deliver(t, "send_photo", png, silent=silent)
         if not ok:
             return False
-        if message_id and t.channel == "tg":
+        if message_id and hasattr(sink, "edit_graph"):
             self.db.add_graph_message(delivered.channel, delivered.target, day, str(message_id), data.hash,
                                       diff_hash, state, self.render_key(state, now))
         for m in old_live:                            # попередні повідомлення на цю дату більше не живі
@@ -267,8 +272,9 @@ class GraphImages:
             queues = self.chat_queues(m.channel, m.target)
         try:
             png, caption, buttons = self.compose(m.day, m.hash, state, queues, diff_hash=m.diff_hash, now=now,
-                                                 footer=footer)
-            await sink.edit_graph(m.target, m.message_id, png, caption, buttons=buttons)
+                                                 footer=footer, channel=m.channel)
+            new_id = await sink.edit_graph(m.target, m.message_id, png, caption,
+                                           buttons=buttons if m.channel == "tg" else ())
         except (MessageGone, TargetGone) as exc:
             log.info("Картинку графіка %s/%s (%s) більше не можна змінити: %s", m.channel, m.target,
                      m.message_id, exc)
@@ -280,7 +286,8 @@ class GraphImages:
         except Exception:
             log.warning("Не вдалось оновити картинку графіка %s/%s", m.channel, m.target, exc_info=True)
             return False
-        self.db.update_graph_message(m.id, state=state, render_key=self.render_key(state, now))
+        changed = {"message_id": str(new_id)} if new_id and str(new_id) != m.message_id else {}   # Slack: новий файл
+        self.db.update_graph_message(m.id, state=state, render_key=self.render_key(state, now), **changed)
         return True
 
     # --- щохвилинне оновлення ----------------------------------------------------

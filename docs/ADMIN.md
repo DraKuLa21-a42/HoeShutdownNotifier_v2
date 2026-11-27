@@ -29,7 +29,7 @@ sudo git clone https://github.com/DraKuLa21-a42/HoeShutdownNotifier_v2.git /opt/
 sudo chown -R hoe:hoe /opt/HoeShutdownNotifier
 cd /opt/HoeShutdownNotifier
 
-sudo apt install -y fonts-dejavu-core   # шрифт із кирилицею для картинки графіка
+sudo apt install -y fonts-dejavu-core   # шрифт із кирилицею для картинки графіка (Fedora/RHEL: dnf install dejavu-sans-fonts)
 sudo -u hoe python3 -m venv venv
 sudo -u hoe venv/bin/pip install --no-cache-dir -r requirements.txt
 sudo -u hoe cp .env.example .env
@@ -218,7 +218,9 @@ venv/bin/python -c "from cryptography.fernet import Fernet; print(Fernet.generat
 нижче ігноруються) і малює вертикальну картинку під смартфон. Картинку з сайту в такому разі не дублює; якщо на сайті
 лише картинка — надсилає її, як і раніше.
 
-Життєвий цикл (лише Telegram; у Slack картинки тільки надсилаються):
+Життєвий цикл (у Slack так само, лише без кнопки «Оновити»: картинка там — приватний файл бота в image-блоці
+повідомлення, оновлення — `chat.update` з новим файлом, старий файл видаляється; потрібні права `chat:write` і
+`files:write`):
 
 1. Новий графік на дату → нове повідомлення-картинка в кожному чаті з «Графік: картинка» (з підписом: інтервали
    й години без світла для черг чату).

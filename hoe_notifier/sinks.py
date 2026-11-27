@@ -26,6 +26,14 @@ class MessageGone(Exception):
     """Повідомлення, яке треба відредагувати, видалено (або його вже не можна змінити)."""
 
 
+class MissingScope(Exception):
+    """Slack-боту бракує права (наприклад, files:write) — налаштування застосунку, а не збій мережі."""
+
+    def __init__(self, needed: str, target: str) -> None:
+        super().__init__(f"Slack-боту бракує права {needed}")
+        self.needed, self.target = needed, target
+
+
 class ChannelError(Exception):
     """Канал не вдалося знайти або перевірити; текст призначений для користувача."""
 
@@ -292,14 +300,97 @@ class SlackSink:
         client, channel = self._client_and_channel(target)
         await self._run(client.pins_remove, channel=channel, timestamp=message_id)
 
+    async def _scoped(self, target: str, func, **kwargs):
+        """Виклик, для якого потрібне окреме право: missing_scope → MissingScope (зрозуміле повідомлення власнику)."""
+        from slack_sdk.errors import SlackApiError
+        try:
+            return await self._run(func, **kwargs)
+        except SlackApiError as exc:
+            if exc.response.get("error") == "missing_scope":
+                raise MissingScope(exc.response.get("needed") or "?", target) from exc
+            raise
+
     async def send_photo(self, target, data, *, silent):
         client, channel = self._client_and_channel(target)
-        await self._run(client.files_upload_v2, channel=channel, content=data, filename="graph.png")
+        await self._scoped(target, client.files_upload_v2, channel=channel, content=data, filename="graph.png")
+
+    # --- картинка графіка, яку бот оновлює -----------------------------------------------
+    # Картинка — приватний (не опублікований у канал) файл бота, показаний у повідомленні image-блоком через
+    # `slack_file`. Оновлення: новий файл → chat.update того самого повідомлення → старий файл видаляється.
+    # Ідентифікатор повідомлення для бази: «<ts>|<id файлу>».
+    GRAPH_RETRIES = (1, 2, 4)        # с: Slack може ще обробляти щойно завантажений файл
+
+    @staticmethod
+    def _mrkdwn(caption: str) -> str:
+        text = re.sub(r"</?b>", "*", caption)
+        text = re.sub(r"</?i>", "_", text)
+        text = re.sub(r"<[^>]+>", "", text)
+        return text.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", '"').replace("&amp;", "&")
+
+    async def _upload_private(self, client, data: bytes, target: str = "") -> str:
+        resp = await self._scoped(target, client.files_upload_v2, content=data, filename="graph.png",
+                                  title="Графік відключень")
+        file = resp.get("file") or (resp.get("files") or [{}])[0]
+        file_id = file.get("id") if isinstance(file, dict) else None
+        if not file_id:
+            raise RuntimeError("Slack не повернув ID завантаженого файлу")
+        return file_id
+
+    def _graph_blocks(self, caption: str, file_id: str) -> tuple[str, list[dict]]:
+        text = fit_body(self._mrkdwn(caption), SLACK_BODY_LIMIT)
+        blocks = [
+            {"type": "section", "text": {"type": "mrkdwn", "text": text}},
+            {"type": "image", "slack_file": {"id": file_id}, "alt_text": "Графік погодинних відключень"},
+        ]
+        return text.split("\n", 1)[0][:150], blocks
+
+    async def _with_file_retry(self, func, **kwargs):
+        """Повідомлення з щойно завантаженим файлом: якщо Slack ще не готовий (invalid_blocks) — повторюємо."""
+        from slack_sdk.errors import SlackApiError
+        for delay in (*self.GRAPH_RETRIES, None):
+            try:
+                return await self._run(func, **kwargs)
+            except SlackApiError as exc:
+                if exc.response.get("error") not in {"invalid_blocks", "invalid_blocks_format"} or delay is None:
+                    raise
+                await asyncio.sleep(delay)
+
+    async def _delete_file(self, client, file_id: str) -> None:
+        try:
+            await self._run(client.files_delete, file=file_id)
+        except Exception as exc:          # не критично: лише зайвий файл у воркспейсі
+            log.info("Не вдалось видалити старий файл графіка %s у Slack: %s", file_id, exc)
 
     async def send_graph(self, target, data, caption, *, silent, buttons=(), reply_to=None):
-        """У Slack картинку не оновлюємо — лише надсилаємо (підпис без HTML-розмітки)."""
+        """Кнопок і відповідей у Slack немає (бот там лише пише). Повертає «ts|id файлу»."""
         client, channel = self._client_and_channel(target)
-        plain = re.sub(r"<[^>]+>", "", caption).replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
-        await self._run(client.files_upload_v2, channel=channel, content=data, filename="graph.png",
-                        initial_comment=plain)
-        return None
+        file_id = await self._upload_private(client, data, target)
+        text, blocks = self._graph_blocks(caption, file_id)
+        try:
+            resp = await self._with_file_retry(client.chat_postMessage, channel=channel, text=text, blocks=blocks)
+        except Exception:
+            await self._delete_file(client, file_id)
+            raise
+        ts = resp.get("ts") if hasattr(resp, "get") else None
+        return f"{ts}|{file_id}" if ts else None
+
+    async def edit_graph(self, target, message_id, data, caption, *, buttons=()):
+        """Замінює картинку й підпис у тому самому повідомленні. Повертає новий ідентифікатор («ts|новий файл»)."""
+        from slack_sdk.errors import SlackApiError
+        ts, _, old_file = str(message_id).partition("|")
+        client, channel = self._client_and_channel(target)
+        file_id = await self._upload_private(client, data, target)
+        text, blocks = self._graph_blocks(caption, file_id)
+        try:
+            await self._with_file_retry(client.chat_update, channel=channel, ts=ts, text=text, blocks=blocks)
+        except SlackApiError as exc:
+            await self._delete_file(client, file_id)
+            if exc.response.get("error") in {"message_not_found", "cant_update_message", "edit_window_closed"}:
+                raise MessageGone(exc.response.get("error")) from exc
+            raise
+        except Exception:
+            await self._delete_file(client, file_id)
+            raise
+        if old_file:
+            await self._delete_file(client, old_file)
+        return f"{ts}|{file_id}"
