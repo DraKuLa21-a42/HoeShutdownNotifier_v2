@@ -77,38 +77,49 @@ def queue_line(line: str) -> str | None:
 
 
 def filter_schedule(text: str, queues: Iterable[str] | None) -> str:
-    """Текстовий графік: заголовок + рядки лише вказаних черг. Без `queues` текст не змінюється.
+    """Текстовий графік: заголовки + рядки лише вказаних черг. Без `queues` текст не змінюється.
 
     Групи, у яких не лишилось жодного рядка черги, відкидаються; порожні рядки між групами зберігаються.
-    Якщо у графіку немає рядків потрібних черг, дописується про це примітка.
+    Графік може складатися з кількох блоків (напр. «Додаткові години…» над основним графіком): блок —
+    заголовки й групи черг після них. Блок без жодного рядка потрібних черг відкидається разом із заголовками.
+    Якщо потрібних черг немає ніде, лишаються заголовки першого блоку й примітка про це.
     """
     wanted = sorted({q for q in (queues or ())})
     if not wanted or not text:
         return text
 
-    had_queue_lines = kept_queue_lines = False
-    groups: list[str] = []
+    # Блоки: [[(group_text, kind), ...], ...], kind: "head" | "queues" (з рядками черг).
+    blocks: list[list[tuple[str, str]]] = []
+    had_queue_lines = False
     for group in _BLANK_LINE.split(text.strip()):
-        kept: list[str] = []
-        group_has_queues = False
-        for line in group.split("\n"):
-            q = queue_line(line)
-            if q is None:
-                kept.append(line)
-                continue
-            had_queue_lines = group_has_queues = True
-            if any(queue_matches(q, w) for w in wanted):
-                kept.append(line)
-                kept_queue_lines = True
-        if group_has_queues and not any(queue_line(l) for l in kept):
-            continue
-        if kept:
-            groups.append("\n".join(kept))
+        lines = group.split("\n")
+        has_q = any(queue_line(l) for l in lines)
+        had_queue_lines |= has_q
+        kind = "queues" if has_q else "head"
+        if not blocks or (kind == "head" and any(k == "queues" for _, k in blocks[-1])):
+            blocks.append([])
+        blocks[-1].append((group, kind))
 
     if not had_queue_lines:      # формат невідомий — краще віддати як є, ніж спотворити
         return text
-    result = "\n\n".join(groups)
-    if not kept_queue_lines:
-        noun = "черги" if len(wanted) == 1 else "черг"
-        result += f"\n\nДля {noun} {', '.join(wanted)} у цьому графіку відключень немає."
-    return result
+
+    out_blocks: list[list[str]] = []
+    for block in blocks:
+        kept_groups, kept_any = [], False
+        for group, kind in block:
+            if kind == "head":
+                kept_groups.append(group)
+                continue
+            kept = [l for l in group.split("\n")
+                    if (q := queue_line(l)) is None or any(queue_matches(q, w) for w in wanted)]
+            if any(queue_line(l) for l in kept):
+                kept_groups.append("\n".join(kept))
+                kept_any = True
+        if kept_any:
+            out_blocks.append(kept_groups)
+
+    if out_blocks:
+        return "\n\n".join(g for block in out_blocks for g in block)
+    noun = "черги" if len(wanted) == 1 else "черг"
+    heads = [g for g, k in blocks[0] if k == "head"]
+    return "\n\n".join([*heads, f"Для {noun} {', '.join(wanted)} у цьому графіку відключень немає."])

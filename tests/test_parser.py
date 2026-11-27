@@ -95,7 +95,8 @@ def test_house_suggestions():
 
 
 # ---------------------------------------------------------------- текстовий графік
-REAL_PAGE = (Path(__file__).parent / "fixtures" / "graph_text_page.html").read_text(encoding="utf-8")
+FIXTURES = Path(__file__).parent / "fixtures"
+REAL_PAGE = (FIXTURES / "graph_text_page.html").read_text(encoding="utf-8")
 
 
 def test_text_schedule_from_real_page():
@@ -222,7 +223,86 @@ def test_text_schedule_split_into_paragraphs_filters_by_queue():
     assert "Підчерга 3.2 – 02:00-06:00." in out and "Підчерга 3.1" not in out and "Підчерга 1.1" not in out
 
 
-def test_text_schedule_paragraphs_do_not_cross_hr():
-    html = ("<div class='post'><p>Підчерга 1.1 – 00:00-04:00.</p><hr>"
+def test_full_text_schedule_does_not_cross_hr():
+    rows = "<br>".join(f"Підчерга {q} – 00:00-04:00." for q in
+                       (f"{n}.{m}" for n in range(1, 7) for m in (1, 2)))
+    html = f"<div class='post'><p>{rows}</p><hr><p>Підчерга 2.1 – 04:00-08:00.</p></div>"
+    assert "04:00-08:00" not in parse_text_schedule(html)
+
+
+def test_partial_schedule_crosses_only_one_hr():
+    html = ("<div class='post'><p>Підчерга 1.1 – 00:00-04:00.</p><hr><p>Перевірити чергу</p><hr>"
             "<p>Підчерга 2.1 – 04:00-08:00.</p></div>")
     assert parse_text_schedule(html) == "Підчерга 1.1 – 00:00-04:00."
+
+
+def test_real_page_27_11_extra_hours_separated_by_hr():
+    from hoe_notifier.queues import filter_schedule
+    html = (FIXTURES / "graph_extra_hours_27_11.html").read_text(encoding="utf-8")
+    text = parse_text_schedule(html)
+    lines = [l for l in text.splitlines() if l]
+    assert lines[:3] == ["За розпорядженням НЕК «Укренерго» оновлено графік погодинних відключень (ГПВ) на 27 "
+                         "листопада (оновлено, 12:30).", "Додаткові години відсутності електроенергії:",
+                         "Підчерга 6.1 - 13:00-14:00"]
+    assert sum(l.startswith("Підчерга") for l in lines) == 13
+    assert lines[-1] == "Підчерга 6.2 – 08:00-11:00; 14:00-17:00; 20:00-22:00."
+    assert "Перевірити чергу" not in text and "Файли" not in text
+    out = filter_schedule(text, ["4.1"])
+    assert "Додаткові" not in out and out.splitlines()[-1].startswith("Підчерга 4.1 – 06:00-08:00")
+
+# ------------------------------- «Додаткові години» над основним графіком (сайт, 27.11.2026)
+_FULL_27 = [
+    "Підчерга 1.1 – 06:00-08:00; 11:00-14:00.", "Підчерга 1.2 – 06:00-08:00; 10:00-14:00.",
+    "Підчерга 2.1 – 08:00-10:00.", "Підчерга 2.2 – 11:00-14:00.",
+    "Підчерга 3.1 – 08:00-11:00.", "Підчерга 3.2 – 08:00-11:00; 17:00-20:00.",
+    "Підчерга 4.1 – 06:00-08:00.", "Підчерга 4.2 – 11:00-14:00.",
+    "Підчерга 5.1 – 08:00-11:00.", "Підчерга 5.2 – 06:00-08:00.",
+    "Підчерга 6.1 – 14:00-17:00; 20:00-22:00.", "Підчерга 6.2 – 08:00-11:00.",
+]
+EXTRA_HOURS_PAGE = (
+    "<div class='post'>"
+    "<p>За розпорядженням НЕК «Укренерго» оновлено графік погодинних відключень (ГПВ) на 27 листопада (оновлено, 12:30).</p>"
+    "<p>Додаткові години відсутності електроенергії:</p>"
+    "<p>Підчерга 6.1 - 13:00-14:00</p>"
+    "<p>&nbsp;</p>"
+    "<p>За розпорядженням НЕК «Укренерго» 27.11.2026 р. на Хмельниччині будуть застосовані графіки погодинних "
+    "відключень (ГПВ).</p>"
+    "<p>Години відсутності електроенергії:</p>"
+    + "".join(f"<p>{a}<br>{b}</p>" for a, b in zip(_FULL_27[::2], _FULL_27[1::2])) +
+    "<p>26.11.2026 р.</p>"
+    "<p>За розпорядженням НЕК «Укренерго» графік погодинних відключень (ГПВ) на 26 листопада.</p>"
+    "<p>Години відсутності електроенергії:</p>"
+    "<p>Підчерга 1.1 – 00:00-04:00.<br>Підчерга 1.2 – 04:00-08:00.</p>"
+    "<hr><p>Перевірити чергу</p></div>"
+)
+
+
+def test_extra_hours_block_is_followed_by_main_schedule():
+    text = parse_text_schedule(EXTRA_HOURS_PAGE)
+    lines = [l for l in text.splitlines() if l]
+    assert lines[0].endswith("(оновлено, 12:30).")
+    assert lines[1:3] == ["Додаткові години відсутності електроенергії:", "Підчерга 6.1 - 13:00-14:00"]
+    assert "будуть застосовані графіки" in lines[3] and lines[4] == "Години відсутності електроенергії:"
+    assert lines[5:] == _FULL_27                               # основний графік повністю
+    assert "26 листопада" not in text and "00:00-04:00" not in text   # старіший графік не береться
+
+
+def test_extra_hours_filtered_for_other_queue_drops_extra_block():
+    from hoe_notifier.queues import filter_schedule
+    out = filter_schedule(parse_text_schedule(EXTRA_HOURS_PAGE), ["3.2"])
+    assert "Додаткові години" not in out and "оновлено, 12:30" not in out
+    assert out.splitlines()[-1] == "Підчерга 3.2 – 08:00-11:00; 17:00-20:00."
+    assert "будуть застосовані графіки" in out and "Підчерга 3.1" not in out
+
+
+def test_extra_hours_filtered_for_affected_queue_shows_both_blocks():
+    from hoe_notifier.queues import filter_schedule
+    out = filter_schedule(parse_text_schedule(EXTRA_HOURS_PAGE), ["6.1"])
+    lines = [l for l in out.splitlines() if l]
+    assert lines.count("Підчерга 6.1 - 13:00-14:00") == 1 and "Підчерга 6.1 – 14:00-17:00; 20:00-22:00." in lines
+    assert "Додаткові години відсутності електроенергії:" in lines and "Підчерга 6.2" not in out
+
+
+def test_full_schedule_first_does_not_pull_older_one():
+    text = parse_text_schedule(MULTI_P_PAGE)        # перший блок має всі 12 підчерг
+    assert "00:00-04:00" not in text

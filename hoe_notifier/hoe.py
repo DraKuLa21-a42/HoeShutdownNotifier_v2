@@ -132,27 +132,13 @@ def _is_header_paragraph(text: str) -> bool:
             and bool(_HEADER_HINT.search(text)))
 
 
-def parse_text_schedule(html: str) -> str | None:
-    """Текстовий графік (ГПВ) зі сторінки: заголовок і рядки черг з інтервалами часу (`00:00-04:00`).
+_SUBQUEUE = re.compile(r"^\s*(?:під)?черга\s+(\d\.\d)(?!\d)", re.IGNORECASE | re.MULTILINE)
+_ALL_SUBQUEUES = frozenset(f"{n}.{m}" for n in range(1, 7) for m in (1, 2))
+_MAX_GAP_PARAGRAPHS = 3   # між блоками графіка (напр. рядок з датою «27.11.2026 р.»)
 
-    Сайт публікує графік у двох виглядах:
-      * один `<p>` у `div.post`, рядки розділені `<br>`, групи черг — подвійним `<br>`;
-      * кілька `<p>` поспіль: заголовок, «Години відсутності електроенергії:», далі по абзацу на групу черг.
-    Беремо перший такий графік: суміжні абзаци з чергами плюс абзаци-заголовки безпосередньо перед ними.
-    Абзаци у результаті розділяються порожнім рядком, як і групи всередині одного абзацу.
-    Розпізнаємо за змістом, а не за точним формулюванням, бо текст щодня трохи інший.
-    Результат не залежить від того, як перенесено рядки у вихідному коді сторінки.
-    """
-    soup = BeautifulSoup(html, "html.parser")
-    root = soup.select_one("div.post") or soup
-    # <hr> — межа розділу сторінки: графік через неї не продовжується. None позначає таку межу.
-    items: list[str | None] = [None if el.name == "hr" else _paragraph_text(el) for el in root.find_all(["p", "hr"])]
 
-    start = next((i for i, t in enumerate(items) if t is not None and _is_schedule_paragraph(t)), None)
-    if start is None:
-        return None
-
-    # Вперед: наступні абзаци з чергами (порожні абзаци між ними пропускаємо).
+def _schedule_block(items: list[str | None], start: int) -> tuple[int, int]:
+    """Блок графіка навколо абзацу `start` з чергами: (перший, останній) індекси з заголовками перед ним."""
     end = start
     j = start + 1
     while j < len(items) and items[j] is not None:
@@ -164,7 +150,6 @@ def parse_text_schedule(html: str) -> str | None:
         end = j
         j += 1
 
-    # Назад: заголовки безпосередньо перед графіком.
     first = start
     k = start - 1
     while k >= 0 and start - k <= _MAX_HEADER_PARAGRAPHS and items[k] is not None:
@@ -175,8 +160,65 @@ def parse_text_schedule(html: str) -> str | None:
             break
         first = k
         k -= 1
+    return first, end
 
-    parts = [t for t in items[first:end + 1] if t]
+
+def parse_text_schedule(html: str) -> str | None:
+    """Текстовий графік (ГПВ) зі сторінки: заголовки і рядки черг з інтервалами часу (`00:00-04:00`).
+
+    Сайт публікує графік у двох виглядах:
+      * один `<p>` у `div.post`, рядки розділені `<br>`, групи черг — подвійним `<br>`;
+      * кілька `<p>` поспіль: заголовок, «Години відсутності електроенергії:», далі по абзацу на групу черг.
+
+    Блок графіка — суміжні абзаци з чергами плюс абзаци-заголовки безпосередньо перед ними.
+    Беремо перший блок. Якщо в ньому є не всі підчерги (напр. «Додаткові години відсутності електроенергії:
+    Підчерга 6.1 …» над основним графіком, відокремлені `<hr>`), дописуємо наступні блоки, доки не будуть
+    усі 12 підчерг.
+    Повний графік першим (а нижче — старіша версія) береться сам, без старішої.
+    Абзаци у результаті розділяються порожнім рядком, як і групи всередині одного абзацу.
+    Розпізнаємо за змістом, а не за точним формулюванням, бо текст щодня трохи інший.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    root = soup.select_one("div.post") or soup
+    # <hr> — межа розділу сторінки (None). Повний графік через неї не продовжується; неповний (лише
+    # «Додаткові години») — продовжується наступним блоком за однією межею.
+    items: list[str | None] = [None if el.name == "hr" else _paragraph_text(el) for el in root.find_all(["p", "hr"])]
+
+    start = next((i for i, t in enumerate(items) if t is not None and _is_schedule_paragraph(t)), None)
+    if start is None:
+        return None
+
+    blocks = [_schedule_block(items, start)]
+    covered = set(_SUBQUEUE.findall("\n".join(t for t in items[blocks[0][0]:blocks[0][1] + 1] if t)))
+    # Формат без підчерг («Черга 1») — не знаємо, що таке «повний», тож лише перший блок.
+    while covered and not _ALL_SUBQUEUES <= covered:
+        # Наступний блок: шукаємо абзац із чергами далі, пропускаючи не більше кількох сторонніх абзаців
+        # і однієї межі <hr> (сайт розділяє «Додаткові години» й основний графік саме нею).
+        j, gap, hrs, nxt = blocks[-1][1] + 1, 0, 0, None
+        while j < len(items):
+            t = items[j]
+            if t is None:
+                hrs += 1
+                if hrs > 1:
+                    break
+                j += 1
+                continue
+            if t and _is_schedule_paragraph(t):
+                nxt = j
+                break
+            if t and not _is_header_paragraph(t):
+                gap += 1
+                if gap > _MAX_GAP_PARAGRAPHS:
+                    break
+            j += 1
+        if nxt is None:
+            break
+        first, end = _schedule_block(items, nxt)
+        blocks.append((max(first, blocks[-1][1] + 1), end))
+        covered |= set(_SUBQUEUE.findall("\n".join(t for t in items[nxt:end + 1] if t)))
+
+    parts = [t for first, end in blocks for t in items[first:end + 1] if t and (
+        _is_schedule_paragraph(t) or _is_header_paragraph(t))]
     return "\n\n".join(parts)
 
 
