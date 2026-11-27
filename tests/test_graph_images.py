@@ -4,7 +4,7 @@ import pytest
 
 from hoe_notifier import render
 from hoe_notifier.db import Database, GraphTarget
-from hoe_notifier.graph_images import REFRESH_CALLBACK, GraphImages
+from hoe_notifier.graph_images import MAX_RESENDS, REFRESH_CALLBACK, GraphImages
 from hoe_notifier.hoe import Graphs
 from hoe_notifier.monitor import Monitor
 from hoe_notifier.schedule import KYIV, parse_days
@@ -134,13 +134,51 @@ async def test_live_minutes_zero_only_transitions(env):
     assert await gi.tick() == 1
 
 
-async def test_deleted_message_stops_being_tracked(env):
+async def test_deleted_actual_message_is_sent_again_silently(env):
+    db, sink, gi, clock = env
+    await gi.publish([day(TOMORROW, "Підчерга 4.2 – 10:00-12:00.")], [T])
+    first = sink.sent[-1]["id"]
+    sink.gone.add(first)
+    clock.set(2026, 11, 28, 0, 0)                     # «Завтра» → «Сьогодні»: редагування не вдається
+    assert await gi.tick() == 1
+    again = sink.sent[-1]
+    assert again["id"] != first and again["silent"] is True and again["reply_to"] is None
+    assert "Сьогодні, сб 28.11" in again["caption"]
+    assert [m.message_id for m in db.live_graph_messages()] == [again["id"]]
+
+
+async def test_deleted_message_resent_at_most_max_times(env):
+    db, sink, gi, clock = env
+    await gi.publish([day(TOMORROW, "Підчерга 4.2 – 10:00-12:00.")], [T])
+    for minute in range(MAX_RESENDS + 1):
+        sink.gone.add(sink.sent[-1]["id"])
+        clock.set(2026, 11, 28, minute * 2, 0)        # щоразу новий 30-хвилинний проміжок
+        await gi.tick()
+    assert len(sink.sent) == 1 + MAX_RESENDS
+    assert db.live_graph_messages() == []             # після ліміту більше не відстежуємо й не надсилаємо
+
+
+async def test_deleted_message_not_resent_when_chat_disabled_images(env):
     db, sink, gi, clock = env
     await gi.publish([day(TOMORROW, "Підчерга 4.2 – 10:00-12:00.")], [T])
     sink.gone.add(sink.sent[-1]["id"])
+    for sub in db.list_subscriptions("tg", "1"):
+        db.delete_subscription(sub.id)
     clock.set(2026, 11, 28, 0, 0)
     assert await gi.tick() == 0
-    assert db.live_graph_messages() == []
+    assert len(sink.sent) == 1 and db.live_graph_messages() == []
+
+
+async def test_deleted_past_or_superseded_message_not_resent(env):
+    db, sink, gi, clock = env
+    await gi.publish([day(TOMORROW, "Підчерга 4.2 – 10:00-12:00.")], [T])
+    sink.gone.add(sink.sent[-1]["id"])
+    # графік змінили: стару копію треба позначити «Застарілою», але її видалено — нової зайвої не шлемо
+    await gi.publish([day(TOMORROW, "Підчерга 4.2 – 10:00-13:00.")], [T])
+    assert len(sink.sent) == 2
+    sink.gone.add(sink.sent[-1]["id"])
+    clock.set(2026, 11, 29, 0, 5)                     # учорашню («Минув») заново не надсилаємо
+    assert await gi.tick() == 0 and len(sink.sent) == 2
 
 
 async def test_past_dates_on_site_are_ignored_and_force_resends(env):

@@ -9,6 +9,9 @@
     черг чату), попереднє стає сірим «Застарілим» і на нього дається відповідь.
 У Slack так само, лише без кнопки «Оновити» і без відповіді на попереднє повідомлення (картинка в Slack —
 приватний файл бота в image-блоці; оновлення — chat.update з новим файлом).
+
+Якщо актуальну картинку («Сьогодні»/«Завтра») видалили з чату, а чат досі підписаний на картинку, бот
+надсилає її знову (без звуку), але не більше MAX_RESENDS разів на дату: видаляють і далі — більше не надсилає.
 """
 from __future__ import annotations
 
@@ -32,6 +35,7 @@ log = logging.getLogger(__name__)
 REFRESH_CALLBACK = "gimg:r:"          # + YYYY-MM-DD
 REFRESH_COOLDOWN = 15                 # с між натисканнями «Оновити» на одному повідомленні
 KEEP_DAYS = 7                         # скільки днів зберігати графіки й записи про повідомлення
+MAX_RESENDS = 2                       # скільки разів за дату заново надсилати видалену картинку в один чат
 TICK_INTERVAL = 60
 
 
@@ -68,6 +72,7 @@ class GraphImages:
         self.clock = clock
         self.lock = asyncio.Lock()
         self._pressed: dict[tuple[str, str, str], float] = {}
+        self._resends: dict[tuple[str, str, str], int] = {}   # (channel, target, day) → скільки разів надіслано знову
         self.last_tick_at: float | None = None
 
     # --- стан ------------------------------------------------------------
@@ -279,6 +284,8 @@ class GraphImages:
             log.info("Картинку графіка %s/%s (%s) більше не можна змінити: %s", m.channel, m.target,
                      m.message_id, exc)
             self.db.update_graph_message(m.id, state="gone")
+            if isinstance(exc, MessageGone) and state in {"today", "tomorrow"}:
+                return await self._resend_deleted(m, state)
             return False
         except LookupError:
             self.db.update_graph_message(m.id, state="gone")
@@ -289,6 +296,29 @@ class GraphImages:
         changed = {"message_id": str(new_id)} if new_id and str(new_id) != m.message_id else {}   # Slack: новий файл
         self.db.update_graph_message(m.id, state=state, render_key=self.render_key(state, now), **changed)
         return True
+
+    async def _resend_deleted(self, m: GraphMessage, state: str) -> bool:
+        """Актуальну картинку видалили з чату — надсилає її знову, якщо чат досі хоче картинку."""
+        target = next((t for t in self.db.graph_targets(images=True)
+                       if t.channel == m.channel and t.target == m.target), None)
+        if target is None:
+            return False                              # чат вимкнув картинку або відписався
+        if self.db.live_graph_messages(m.channel, m.target, m.day):
+            return False                              # на цю дату в чаті вже є інша жива картинка
+        key = (m.channel, m.target, m.day)
+        today = self.clock().date().isoformat()
+        for k in [k for k in self._resends if k[2] < today]:
+            del self._resends[k]
+        if self._resends.get(key, 0) >= MAX_RESENDS:
+            log.info("Картинку графіка на %s у %s/%s видалили вже %d раз(и) — більше не надсилаю",
+                     m.day, m.channel, m.target, MAX_RESENDS + 1)
+            return False
+        self._resends[key] = self._resends.get(key, 0) + 1
+        # без звуку: це не нова інформація, а відновлення видаленого повідомлення
+        resent = await self._send_day(GraphTarget(target.channel, target.target, True, target.queues), m.day, "new")
+        log.info("Картинку графіка на %s у %s/%s видалено — %s (%d/%d)", m.day, m.channel, m.target,
+                 "надіслав знову" if resent else "не вдалося надіслати знову", self._resends[key], MAX_RESENDS)
+        return resent
 
     # --- щохвилинне оновлення ----------------------------------------------------
     async def tick(self) -> int:
