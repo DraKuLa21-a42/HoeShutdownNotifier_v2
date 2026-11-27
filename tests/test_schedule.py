@@ -84,9 +84,9 @@ def test_status_and_changes():
     d = parse_days(page("<p>ГПВ на 27 листопада:</p><p>Підчерга 1.1 – 10:00-12:00; 17:00-20:00.</p>"), TODAY)[0]
     s = d.slots["1.1"]
     at = lambda h, m: datetime(2026, 11, 27, h, m, tzinfo=KYIV)  # noqa: E731
-    assert status_now(s, at(9, 15)) == "🟢 світло є · відключення о 10:00 (через 45 хв)"
-    assert status_now(s, at(11, 0), with_left=False) == "🔴 світла немає · увімкнення о 12:00"
-    assert status_now(s, at(21, 0)) == "🟢 світло є · до кінця доби відключень немає"
+    assert status_now(s, at(9, 15)) == "🟢 світло є за графіком · планове відключення о 10:00 (через 45 хв)"
+    assert status_now(s, at(11, 0), with_left=False) == "🔴 світла немає за графіком · планове увімкнення о 12:00"
+    assert status_now(s, at(21, 0)) == "🟢 світло є за графіком · до кінця доби відключень не заплановано"
     new = parse_days(page("<p>ГПВ на 27 листопада:</p><p>Підчерга 1.1 – 09:00-12:00.</p>"), TODAY)[0].slots["1.1"]
     assert changes(s, new) == "+09:00–10:00, −17:00–20:00"
     assert changes(s, s) == ""

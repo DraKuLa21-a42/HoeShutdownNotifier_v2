@@ -260,7 +260,9 @@ def fmt_duration(minutes: int) -> str:
 
 
 def status_now(slots: tuple[bool, ...], now: datetime, *, with_left: bool = True) -> str:
-    """«🟢 світло є · відключення о 17:00 (через 2 год 15 хв)» для поточного моменту доби.
+    """«🟢 світло є за графіком · планове відключення о 17:00 (через 2 год 15 хв)» для поточного моменту доби.
+
+    Це розрахунок за опублікованим графіком, а не фактичний стан мережі, тому скрізь «за графіком» / «планове».
 
     `with_left=False` — без «через …»: у підписі, який оновлюється не щохвилини, це число швидко застаріває.
     """
@@ -274,11 +276,11 @@ def status_now(slots: tuple[bool, ...], now: datetime, *, with_left: bool = True
     tail = (lambda: f" (через {fmt_duration(left)})") if with_left else (lambda: "")
     if off:
         if j >= SLOTS:
-            return "🔴 світла немає до кінця доби"
-        return f"🔴 світла немає · увімкнення о {fmt_slot(j)}{tail()}"
+            return "🔴 світла немає за графіком · до кінця доби"
+        return f"🔴 світла немає за графіком · планове увімкнення о {fmt_slot(j)}{tail()}"
     if j >= SLOTS:
-        return "🟢 світло є · до кінця доби відключень немає"
-    return f"🟢 світло є · відключення о {fmt_slot(j)}{tail()}"
+        return "🟢 світло є за графіком · до кінця доби відключень не заплановано"
+    return f"🟢 світло є за графіком · планове відключення о {fmt_slot(j)}{tail()}"
 
 
 def changes(old: tuple[bool, ...], new: tuple[bool, ...]) -> str:

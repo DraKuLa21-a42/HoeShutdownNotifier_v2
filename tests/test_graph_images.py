@@ -89,12 +89,12 @@ async def test_tomorrow_lifecycle_future_today_past(env):
     assert await gi.tick() == 1
     edit = sink.edits[-1]
     assert edit["id"] == msg["id"] and "Сьогодні, сб 28.11" in edit["caption"]
-    assert "🟢 світло є · відключення о 07:00" in edit["caption"] and edit["buttons"]
+    assert "🟢 світло є за графіком · планове відключення о 07:00" in edit["caption"] and edit["buttons"]
 
     clock.set(2026, 11, 28, 0, 20)
     assert await gi.tick() == 0                                  # той самий 30-хвилинний проміжок
     clock.set(2026, 11, 28, 7, 5)
-    assert await gi.tick() == 1 and "🔴 світла немає · увімкнення о 09:30" in sink.edits[-1]["caption"]
+    assert await gi.tick() == 1 and "🔴 світла немає за графіком · планове увімкнення о 09:30" in sink.edits[-1]["caption"]
 
     clock.set(2026, 11, 29, 0, 1)                                # учорашній — сірий «Минув», без кнопок
     assert await gi.tick() == 1
